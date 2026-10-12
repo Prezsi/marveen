@@ -17,7 +17,7 @@ import { listKanbanCards } from '../db.js'
 import {
   agentHasChannel,
   agentSessionName,
-  capturePane,
+  capturePane, capturePaneWithHistory,
   captureParkedInputView,
   clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
@@ -59,6 +59,7 @@ import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { recordChannelEvent } from './channel-event-log.js'
 import { notifyChannel } from '../notify.js'
 import { sendRoutineAlert } from './routine-alert.js'
+import { nextPermissionPromptAlert, clearPermissionPromptAlert } from './permission-prompt-alert.js'
 import { getProvider, channelStateDir, channelStateDirEnvVar, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestampAcross, mainTranscriptDirs } from './inbound-probe.js'
@@ -2337,6 +2338,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       })
       if (decision.next.firstSeenAt === null) {
         paneMenuState.delete(t.session)
+        // PERMFLOOD1012: the spell is over, so a later prompt is a new question.
+        clearPermissionPromptAlert(t.session)
       } else {
         paneMenuState.set(t.session, decision.next)
       }
@@ -2382,8 +2385,13 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             // requests ~45s after they appeared, while the operator believed
             // they had approved them. Same rule as the unrecognised trust dialog
             // above: no keystroke is neutral, so send none and say so, loudly.
-            logger.warn({ session: t.session, agent: label }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
-            sendAlert(`🔐 A(z) ${label} session egy engedélykérésen vár, és NEM nyomtam meg semmit: ott az Escape NEM-et jelentene. Döntsd el te: tmux attach -t ${t.session}`)
+            // PERMFLOOD1012: this branch is reached once per dedup window for as
+            // long as nobody answers. One open question is one message plus
+            // thinning reminders, and the message says what is being asked
+            // (permission-prompt-alert.ts has the measured incident).
+            const permissionAlert = nextPermissionPromptAlert(label, t.session, paneNow, capturePaneWithHistory(t.session) ?? paneNow)
+            logger.warn({ session: t.session, agent: label, alerted: permissionAlert != null }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
+            if (permissionAlert != null) sendAlert(permissionAlert)
           } else {
             logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
             try {
