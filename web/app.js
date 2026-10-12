@@ -15672,7 +15672,8 @@ function buildSettingRow(def) {
     resetBtn.type = 'button'
     resetBtn.className = 'btn-secondary btn-compact settings-reset-default-btn'
     resetBtn.textContent = t('settings.btn.reset_default')
-    resetBtn.title = t('settings.btn.reset_default_title')
+    const preview = settingResetPreview(def)
+    resetBtn.title = t('settings.btn.reset_default_title') + ' ' + formatSettingValue(preview.from) + ' \u2192 ' + formatSettingValue(preview.to) + ' (' + preview.source + ')'
     resetBtn.addEventListener('click', () => resetSettingToDefault(def, row, resetBtn, errorEl))
     editor.insertBefore(resetBtn, errorEl)
   }
@@ -15697,7 +15698,7 @@ async function removeSettingOverride(row) {
       return { ok: false }
     }
     settingsDirty.delete(def.key)
-    row.replaceWith(buildSettingRow({ ...def, value: data.value, source: data.source }))
+    row.replaceWith(buildSettingRow({ ...def, value: data.value, source: data.source, resetValue: data.value, resetSource: data.source }))
     return { ok: true, source: data.source, requiresRestart: !!data.requiresRestart }
   } catch {
     if (errorEl) errorEl.textContent = 'Kapcsolati hiba'
@@ -15706,6 +15707,10 @@ async function removeSettingOverride(row) {
 }
 
 async function resetSettingToDefault(def, row, btn, errorEl) {
+  // One row is confirmed the same way as a tab: the button used to reset at
+  // once, and the first sign of a wrong click could be a notification on the
+  // wrong channel.
+  if (!(await confirmSettingsReset([settingResetPreview(def)]))) return
   btn.disabled = true
   const group = row.closest('.settings-group')
   const result = await removeSettingOverride(row)
@@ -15748,12 +15753,33 @@ function refreshSettingsGroupReset(group) {
   btn.title = count === 0 ? t('settings.btn.reset_tab_none') : t('settings.btn.reset_tab_title')
 }
 
-// The confirmation for the per-tab reset, in the app's own modal (the native
-// confirm() carries the host name as its title and cannot show a list as a
-// list). Resolves true only on the explicit confirm button; Escape, the close
-// button, the backdrop and Cancel all resolve false, and Cancel has the focus,
-// so Enter on a freshly opened dialog changes nothing.
-function confirmSettingsReset(keys) {
+// What a row turns into when its override is removed, as the page knows it
+// from GET /api/settings: the value that answers without the override, and the
+// layer it comes from (.env or the registry default).
+function settingResetPreview(def) {
+  return {
+    key: def.key,
+    from: String(def.value),
+    to: String(def.resetValue !== undefined ? def.resetValue : def.default),
+    source: def.resetSource === 'env' ? t('settings.source.env') : t('settings.source.default'),
+    requiresRestart: !!def.requiresRestart,
+  }
+}
+
+function formatSettingValue(value) {
+  return value === '' ? t('settings.value.empty') : value
+}
+
+// The confirmation for a reset, per row and per tab, in the app's own modal
+// (the native confirm() carries the host name as its title and cannot show a
+// list as a list). An override is often a deliberate choice, and removing one
+// can switch a safety setting back (notifications on again, isolation off), so
+// the dialog shows for every key what the value is now, what it becomes and
+// where that comes from -- the owner approves a change, not a list of names.
+// Resolves true only on the explicit confirm button; Escape, the close button,
+// the backdrop and Cancel all resolve false, and Cancel has the focus, so
+// Enter on a freshly opened dialog changes nothing.
+function confirmSettingsReset(items) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div')
     overlay.className = 'modal-overlay active'
@@ -15761,7 +15787,7 @@ function confirmSettingsReset(keys) {
     overlay.setAttribute('aria-modal', 'true')
 
     const modal = document.createElement('div')
-    modal.className = 'modal'
+    modal.className = 'modal modal-wide'
 
     const header = document.createElement('div')
     header.className = 'modal-header'
@@ -15779,10 +15805,22 @@ function confirmSettingsReset(keys) {
     message.textContent = t('settings.confirm.reset_tab')
     const list = document.createElement('ul')
     list.className = 'settings-reset-confirm-keys'
-    for (const key of keys) {
-      const item = document.createElement('li')
-      item.textContent = key
-      list.appendChild(item)
+    for (const item of items) {
+      const li = document.createElement('li')
+      const key = document.createElement('span')
+      key.className = 'settings-reset-confirm-key'
+      key.textContent = item.key
+      const change = document.createElement('span')
+      change.className = 'settings-reset-confirm-change'
+      change.textContent = formatSettingValue(item.from) + ' \u2192 ' + formatSettingValue(item.to) + ' (' + item.source + ')'
+      li.append(key, change)
+      if (item.requiresRestart) {
+        const restart = document.createElement('span')
+        restart.className = 'settings-restart-badge'
+        restart.textContent = t('settings.restart_badge')
+        li.appendChild(restart)
+      }
+      list.appendChild(li)
     }
     const actions = document.createElement('div')
     actions.className = 'settings-reset-confirm-actions'
@@ -15820,8 +15858,7 @@ function confirmSettingsReset(keys) {
 async function resetSettingsGroupToDefault(group) {
   const rows = overriddenSettingRows(group)
   if (rows.length === 0) return
-  const keys = rows.map((r) => r._settingDef.key)
-  if (!(await confirmSettingsReset(keys))) return
+  if (!(await confirmSettingsReset(rows.map((r) => settingResetPreview(r._settingDef))))) return
 
   const btn = group.querySelector('.settings-reset-tab-btn')
   if (btn) btn.disabled = true

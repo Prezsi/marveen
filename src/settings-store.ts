@@ -107,6 +107,18 @@ export function getEffectiveSettingSource(key: string): { value: string | number
   return { value: def.default, source: 'default' }
 }
 
+// What would answer for this key WITHOUT its override: .env, then the registry
+// default. This is what a reset turns the value into, and the page shows it
+// before the reset happens (review of #1908: a confirmation that lists only key
+// names cannot show that a reset switches a notification back on).
+export function getSettingFallback(key: string): { value: string | number; source: Exclude<SettingSource, 'override'> } {
+  const def = getSettingDefinition(key)
+  if (!def) throw new Error(`Unknown setting key: ${key}`)
+  const envValue = readEnvFile([key])[key]
+  if (envValue !== undefined) return { value: coerce(def, envValue), source: 'env' }
+  return { value: def.default, source: 'default' }
+}
+
 export function getEffectiveSettingValue(key: string): string | number {
   return getEffectiveSettingSource(key).value
 }

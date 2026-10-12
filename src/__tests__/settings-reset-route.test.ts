@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -78,6 +78,37 @@ describe('GET /api/settings names the layer that answers', () => {
   })
 })
 
+// Review of #1908: a confirmation that lists only key names cannot show that a
+// reset switches a notification back on. The page needs, before the reset, the
+// value that will answer afterwards and the layer it comes from.
+describe('GET /api/settings says what a reset would turn each value into', () => {
+  it('an overridden key with nothing in .env falls back to the registry default', async () => {
+    setOverride('KANBAN_WIP_WARN_PCT', 55)
+    const row = await listed('KANBAN_WIP_WARN_PCT')
+    expect(row).toMatchObject({ value: 55, source: 'override', resetValue: row.default, resetSource: 'default' })
+  })
+
+  it('an overridden key that is also in .env falls back to the .env value, and says so', async () => {
+    envFile.KANBAN_WIP_WARN_PCT = '70'
+    setOverride('KANBAN_WIP_WARN_PCT', 55)
+    expect(await listed('KANBAN_WIP_WARN_PCT')).toMatchObject({ value: 55, source: 'override', resetValue: 70, resetSource: 'env' })
+  })
+
+  it('the preview is what the reset then actually answers', async () => {
+    envFile.KANBAN_WIP_WARN_PCT = '70'
+    setOverride('KANBAN_WIP_WARN_PCT', 55)
+    const before = await listed('KANBAN_WIP_WARN_PCT')
+    const { ctx, out } = call('DELETE', '/api/settings/KANBAN_WIP_WARN_PCT')
+    await tryHandleSettings(ctx)
+    expect(out.body).toMatchObject({ value: before.resetValue, source: before.resetSource })
+  })
+
+  it('a key that is not overridden previews its own current value', async () => {
+    const row = await listed('KANBAN_WIP_WARN_PCT')
+    expect(row).toMatchObject({ source: 'default', resetValue: row.value, resetSource: 'default' })
+  })
+})
+
 describe('DELETE /api/settings/<KEY>', () => {
   it('removes the override: the registry default answers again, and the change is logged', async () => {
     setOverride('KANBAN_WIP_WARN_PCT', 55)
@@ -119,6 +150,18 @@ describe('DELETE /api/settings/<KEY>', () => {
     expect(await tryHandleSettings(ctx)).toBe(true)
     expect(out.status).toBe(404)
     expect(JSON.parse(readFileSync(OVERRIDES_PATH, 'utf-8'))).toEqual({ KANBAN_WIP_WARN_PCT: 55 })
+  })
+
+  it('an unreadable overrides file is 409, and the file is left byte-identical', async () => {
+    const broken = '{ "KANBAN_WIP_WARN_PCT": 55, broken'
+    writeFileSync(OVERRIDES_PATH, broken)
+    reloadOverridesForTest()
+    const { ctx, out } = call('DELETE', '/api/settings/KANBAN_WIP_WARN_PCT')
+    expect(await tryHandleSettings(ctx)).toBe(true)
+    expect(out.status).toBe(409)
+    expect(out.body.error).toContain('invalid-json')
+    expect(readFileSync(OVERRIDES_PATH, 'utf-8')).toBe(broken)
+    expect(configChanges).toEqual([])
   })
 
   it('does not swallow other paths or methods', async () => {

@@ -1,7 +1,7 @@
 import { readBody, json } from '../http-helpers.js'
 import { logger } from '../../logger.js'
 import { SETTINGS_REGISTRY, validateSettingValue } from '../../config-registry.js'
-import { clearOverride, getEffectiveSettingSource, getEffectiveSettingValue, setOverride } from '../../settings-store.js'
+import { clearOverride, getEffectiveSettingSource, getEffectiveSettingValue, getSettingFallback, setOverride } from '../../settings-store.js'
 import { logConfigChange } from '../../db.js'
 import { setStoreWriteActor } from '../../store-watcher.js'
 import { syncRotationHeartbeatTask } from '../claude-rotation-heartbeat.js'
@@ -21,6 +21,10 @@ export async function tryHandleSettings(ctx: RouteContext): Promise<boolean> {
       // Which layer answered: 'override' (saved here, config-overrides.json),
       // 'env' or 'default'. The page offers "reset to default" on 'override'.
       source: getEffectiveSettingSource(def.key).source,
+      // What the value becomes if the override is removed, and from which
+      // layer -- so the page can show "now -> after" before a reset.
+      resetValue: getSettingFallback(def.key).value,
+      resetSource: getSettingFallback(def.key).source,
       default: def.default,
       description: def.description,
       module: def.module,
