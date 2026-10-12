@@ -59,7 +59,7 @@ import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { recordChannelEvent } from './channel-event-log.js'
 import { notifyChannel } from '../notify.js'
 import { sendRoutineAlert } from './routine-alert.js'
-import { nextPermissionPromptAlert, clearPermissionPromptAlert } from './permission-prompt-alert.js'
+import { runPermissionPromptPass, clearPermissionPromptAlert } from './permission-prompt-alert.js'
 import { getProvider, channelStateDir, channelStateDirEnvVar, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestampAcross, mainTranscriptDirs } from './inbound-probe.js'
@@ -2386,12 +2386,12 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             // they had approved them. Same rule as the unrecognised trust dialog
             // above: no keystroke is neutral, so send none and say so, loudly.
             // PERMFLOOD1012: this branch is reached once per dedup window for as
-            // long as nobody answers. One open question is one message plus
-            // thinning reminders, and the message says what is being asked
-            // (permission-prompt-alert.ts has the measured incident).
-            const permissionAlert = nextPermissionPromptAlert(label, t.session, paneNow, capturePaneWithHistory(t.session) ?? paneNow)
-            logger.warn({ session: t.session, agent: label, alerted: permissionAlert != null }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
-            if (permissionAlert != null) sendAlert(permissionAlert)
+            // long as nobody answers. One open question is announced at fixed
+            // marks of its age, and the message says what is being asked. The
+            // decision and the send live in runPermissionPromptPass
+            // (permission-prompt-alert.ts), where they are under test.
+            const alerted = runPermissionPromptPass(label, t.session, paneNow, { captureWithHistory: capturePaneWithHistory, send: sendAlert })
+            logger.warn({ session: t.session, agent: label, alerted }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
           } else {
             logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
             try {

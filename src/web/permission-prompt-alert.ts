@@ -77,6 +77,15 @@ const PERMISSION_CARD_DASH_RX = /^\s*[╌┄-]{8,}\s*$/
 // shape guard matters because the capture may reach past the card, where the
 // nearest rule above the question belongs to something else entirely.
 const PERMISSION_CARD_TITLE_RX = /^[A-Z][A-Za-z]+(?: [A-Za-z]+){0,3}$/
+// The cards whose second line is a PATH: "Edit file", "Create file" (both
+// measured), and any other "<Verb> file". Only on these is the line under the
+// header quoted. On every other card -- a Bash card above all -- that line is
+// the COMMAND, and a command line can carry a literal token
+// (`curl -H "Authorization: Bearer ..."`); the alert goes out to a chat channel
+// and has never carried command text. Review of #1907 fed this module exactly
+// such a card and got the token back in the ask. An allowlist, not a redaction
+// pass: what is never quoted cannot leak in a shape nobody thought to redact.
+const PERMISSION_FILE_CARD_TITLE_RX = /^[A-Z][a-z]+ file$/
 const PERMISSION_ASK_MAX = 260
 const PERMISSION_IDENTITY_MAX = 1500
 
@@ -141,9 +150,11 @@ function capAsk(text: string): string {
  * the pane. In order of how much each says:
  *   1. the tool card summary (title + the reason Claude gives), when the card
  *      has a reason block;
- *   2. the card header and its subject ("Edit file: <path>"), which needs
- *      `deepPane` whenever the edit is longer than the screen;
- *   3. the question line itself.
+ *   2. on a file card, the header and the path ("Edit file: <path>"), which
+ *      needs `deepPane` whenever the edit is longer than the screen;
+ *   3. on any other card, the header alone ("Bash command") -- never the line
+ *      under it, which is the command;
+ *   4. the question line itself, when no header is readable.
  */
 export function permissionPromptAsk(pane: string | null | undefined, deepPane: string | null | undefined = pane): string | null {
   if (!pane && !deepPane) return null
@@ -151,7 +162,12 @@ export function permissionPromptAsk(pane: string | null | undefined, deepPane: s
   if (summary) return capAsk(`${summary.title} -- ${summary.reason}`)
   const card = readPermissionCard(deepPane || pane || '')
   if (!card) return null
-  if (card.title && card.subject) return capAsk(`${card.title}: ${card.subject}`)
+  if (card.title && card.subject && PERMISSION_FILE_CARD_TITLE_RX.test(card.title)) {
+    return capAsk(`${card.title}: ${card.subject}`)
+  }
+  // Any other card with a readable header: the header alone ("Bash command").
+  // It tells the owner what KIND of thing waits, and nothing that was typed.
+  if (card.title) return capAsk(card.title)
   // "Do you want to proceed?" alone says nothing the alert does not already.
   if (/^Do you want to proceed\?$/i.test(card.question)) return null
   return capAsk(card.question)
@@ -277,6 +293,37 @@ export function nextPermissionPromptAlert(
   states.set(session, decision.next)
   if (!decision.send) return null
   return formatPermissionPromptAlert(label, session, ask, decision.waitingMs, decision.nextGapMs)
+}
+
+export interface PermissionPromptPassDeps {
+  /** The same pane with scrollback (agent-process capturePaneWithHistory). */
+  captureWithHistory: (session: string) => string | null
+  /** Where an alert goes (channel-monitor sendAlert). */
+  send: (text: string) => void
+}
+
+/**
+ * Everything the menu pass does for a session parked on a permission prompt,
+ * apart from the keystrokes it does not send: read the card with scrollback,
+ * decide, and alert when a mark is reached. Returns whether it alerted.
+ *
+ * It lives here rather than inline in channel-monitor.ts so that its behaviour
+ * is under test: review of #1907 showed that with the logic at the call site,
+ * silencing the alert, alerting on every pass, or reading only the visible
+ * pane each left the whole suite green.
+ */
+export function runPermissionPromptPass(
+  label: string,
+  session: string,
+  pane: string | null | undefined,
+  deps: PermissionPromptPassDeps,
+  now: number = Date.now(),
+  marks: readonly number[] = configured.marks,
+): boolean {
+  const text = nextPermissionPromptAlert(label, session, pane, deps.captureWithHistory(session) ?? pane, now, marks)
+  if (text == null) return false
+  deps.send(text)
+  return true
 }
 
 /** The prompt is gone (answered, or the session left the menu): forget it. */

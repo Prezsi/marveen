@@ -13,6 +13,7 @@ import {
   formatPermissionPromptAlert,
   humanWaitHu,
   nextPermissionPromptAlert,
+  runPermissionPromptPass,
   clearPermissionPromptAlert,
   resetPermissionPromptAlerts,
 } from '../web/permission-prompt-alert.js'
@@ -66,6 +67,11 @@ describe('permissionPromptAsk: what is being asked', () => {
     const ask = permissionPromptAsk(BASH_PROMPT)
     expect(ask).not.toBeNull()
     expect(ask).toContain(' -- ')
+  })
+
+  it('a "Create file" card names the path too (the other measured file card)', () => {
+    const create = EDIT_PROMPT_DEEP.replace(' Edit file', ' Create file').replace('make this edit to SKILL.md', 'create SKILL.md')
+    expect(permissionPromptAsk(EDIT_PROMPT, create)).toBe('Create file: ../.claude/skills/example-skill/SKILL.md')
   })
 
   it('a bare "Do you want to proceed?" adds nothing, so there is no quote', () => {
@@ -134,6 +140,65 @@ describe('parsePermissionAlertMarks: the configurable schedule', () => {
     const r = parsePermissionAlertMarks(raw)
     expect(r.valid).toBe(false)
     expect(r.marks).toEqual([...DEFAULT_PERMISSION_REMINDER_MARKS_MS])
+  })
+})
+
+// Review of #1907: on a Bash card the line under the header is the command, and
+// the ask quoted it -- token and all -- into an alert that goes to a chat
+// channel. The card below is the shape the review used (synthetic: no capture
+// of a reason-less Bash card exists), with a literal token in the command.
+describe('a command line never reaches the alert', () => {
+  const RULE = '─'.repeat(60)
+  const TOKEN = 'sk-live-AAAABBBBCCCCDDDD'
+  const BASH_NO_REASON = [
+    '● I will call the API now.',
+    '',
+    RULE,
+    ' Bash command',
+    '',
+    `   curl -s -H "Authorization: Bearer ${TOKEN}" https://example.invalid/x`,
+    '',
+    ' Do you want to proceed?',
+    ' ❯ 1. Yes',
+    "   2. Yes, and don't ask again for curl commands in /srv/app",
+    '   3. No, and tell Claude what to do differently (esc)',
+    '',
+    ' Esc to cancel',
+  ].join('\n')
+
+  it('the fixture is a permission prompt', () => {
+    expect(detectsPermissionDialog(BASH_NO_REASON)).toBe(true)
+  })
+
+  it('the ask is the card header alone', () => {
+    expect(permissionPromptAsk(BASH_NO_REASON)).toBe('Bash command')
+  })
+
+  it.each(['password=hunter2 ./deploy.sh', 'mysql -u root:s3cret db', 'export TOKEN=abc123 && run', 'rm -rf ./build'])(
+    'whatever the command is, none of it is quoted: %s',
+    (command) => {
+      const card = BASH_NO_REASON.replace(/   curl .*/, `   ${command}`)
+      expect(permissionPromptAsk(card)).toBe('Bash command')
+    },
+  )
+
+  it('the message that would be sent carries no part of the command', () => {
+    resetPermissionPromptAlerts()
+    const text = nextPermissionPromptAlert('Suzy', 'suzy-channels', BASH_NO_REASON, BASH_NO_REASON, 0, [0, 30 * MIN]) as string
+    expect(text).toContain('Ezt kérdezi: „Bash command”')
+    for (const leaked of [TOKEN, 'Bearer', 'curl', 'example.invalid', 'Authorization']) {
+      expect(text).not.toContain(leaked)
+    }
+  })
+
+  it('two different commands are still two questions (the command is compared, never sent)', () => {
+    const other = BASH_NO_REASON.replace('example.invalid/x', 'example.invalid/y')
+    expect(permissionPromptIdentity(BASH_NO_REASON)).not.toBe(permissionPromptIdentity(other))
+  })
+
+  it('only a "<Verb> file" card has its second line quoted', () => {
+    const fileCard = BASH_NO_REASON.replace(' Bash command', ' Edit file').replace(/   curl .*/, ' src/app.ts').replace('proceed?', 'make this edit to app.ts?')
+    expect(permissionPromptAsk(fileCard)).toBe('Edit file: src/app.ts')
   })
 })
 
@@ -293,5 +358,123 @@ describe('nextPermissionPromptAlert: the monitor-facing half', () => {
     expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 0, NOW_MARKS)).not.toBeNull()
     clearPermissionPromptAlert('suzy-channels')
     expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 5 * MIN, NOW_MARKS)).not.toBeNull()
+  })
+})
+
+// What the menu pass does for a parked permission prompt, end to end, with the
+// two things it touches stubbed: the scrollback capture and the alert sink.
+// Review of #1907 applied four mutations at the call site and the suite stayed
+// green on all of them; each has a case here, and the call site itself is
+// pinned in the last block.
+describe('runPermissionPromptPass: the behaviour of the menu pass branch', () => {
+  beforeEach(() => resetPermissionPromptAlerts())
+
+  function harness(deep: string | null = EDIT_PROMPT_DEEP) {
+    const sent: string[] = []
+    const captured: string[] = []
+    const deps = {
+      captureWithHistory: (session: string) => { captured.push(session); return deep },
+      send: (text: string) => { sent.push(text) },
+    }
+    const pass = (now: number, marks: readonly number[] = DEFAULT_PERMISSION_REMINDER_MARKS_MS) =>
+      runPermissionPromptPass('Suzy', 'suzy-channels', EDIT_PROMPT, deps, now, marks)
+    return { sent, captured, pass }
+  }
+
+  it('one alert at the first mark, none inside the window, one at the next mark', () => {
+    const h = harness()
+    expect(h.pass(0)).toBe(false)
+    expect(h.pass(5 * MIN)).toBe(false)
+    expect(h.sent).toHaveLength(0)
+
+    expect(h.pass(10 * MIN)).toBe(true)
+    expect(h.sent).toHaveLength(1)
+
+    expect(h.pass(15 * MIN)).toBe(false)
+    expect(h.pass(20 * MIN)).toBe(false)
+    expect(h.pass(25 * MIN)).toBe(false)
+    expect(h.sent).toHaveLength(1)
+
+    expect(h.pass(30 * MIN)).toBe(true)
+    expect(h.sent).toHaveLength(2)
+  })
+
+  it('never alerting is a failure, not a quiet success', () => {
+    const h = harness()
+    for (let t = 0; t <= 24 * HOUR; t += 5 * MIN) h.pass(t)
+    expect(h.sent.length).toBe(6) // 10 min, 30 min, 1 h, 2 h, 8 h, 24 h
+  })
+
+  it('alerting on every pass is the flood again', () => {
+    const h = harness()
+    let passes = 0
+    for (let t = 0; t < 8 * HOUR; t += 5 * MIN) { h.pass(t); passes++ }
+    expect(passes).toBe(96)
+    expect(h.sent.length).toBe(4)
+  })
+
+  it('reads the card WITH scrollback: the path is above the diff, off the visible pane', () => {
+    const h = harness()
+    h.pass(0, [0, 30 * MIN])
+    expect(h.captured).toEqual(['suzy-channels'])
+    expect(h.sent[0]).toContain('Ezt kérdezi: „Edit file: ../.claude/skills/example-skill/SKILL.md”')
+  })
+
+  it('with only the visible pane the alert could not name the file', () => {
+    const h = harness(EDIT_PROMPT)
+    h.pass(0, [0, 30 * MIN])
+    expect(h.sent[0]).toContain('Do you want to make this edit to SKILL.md?')
+    expect(h.sent[0]).not.toContain('example-skill')
+  })
+
+  it('a failed scrollback capture falls back to the visible pane instead of going silent', () => {
+    const h = harness(null)
+    expect(h.pass(0, [0, 30 * MIN])).toBe(true)
+    expect(h.sent).toHaveLength(1)
+  })
+
+  it('after the prompt clears nothing is sent, and a later prompt starts its own clock', () => {
+    const h = harness()
+    h.pass(0)
+    h.pass(10 * MIN)
+    expect(h.sent).toHaveLength(1)
+
+    // The owner answers; the menu spell ends and the monitor forgets the prompt.
+    clearPermissionPromptAlert('suzy-channels')
+
+    // The same edit is asked again two hours later. Without the clear it would
+    // inherit the old clock: 2 h is past four marks, so it would alert at once.
+    expect(h.pass(2 * HOUR)).toBe(false)
+    expect(h.pass(2 * HOUR + 5 * MIN)).toBe(false)
+    expect(h.sent).toHaveLength(1)
+    expect(h.pass(2 * HOUR + 10 * MIN)).toBe(true)
+    expect(h.sent).toHaveLength(2)
+  })
+})
+
+describe('channel-monitor is wired to it', () => {
+  const MONITOR = readFileSync(join(__dirname, '..', 'web', 'channel-monitor.ts'), 'utf-8')
+  const branch = MONITOR.slice(
+    MONITOR.indexOf('detectsPermissionDialog(paneNow)'),
+    MONITOR.indexOf("'Session parked in a blocking interactive menu -- sending Escape to recover'"),
+  )
+
+  it('the permission branch exists and is the slice under test', () => {
+    expect(branch.length).toBeGreaterThan(200)
+    expect(branch).toContain('PERMDENY905')
+  })
+
+  it('it runs the pass with the scrollback capture and the real alert sink', () => {
+    expect(branch).toMatch(/runPermissionPromptPass\(label, t\.session, paneNow, \{ captureWithHistory: capturePaneWithHistory, send: sendAlert \}\)/)
+  })
+
+  it('it sends nothing itself: no second alert path beside the pass, and no keystroke', () => {
+    expect(branch).not.toMatch(/sendAlert\(`/)
+    expect(branch).not.toMatch(/sendRoutineAlert\(/)
+    expect(branch).not.toMatch(/send-keys/)
+  })
+
+  it('the end of the menu spell forgets the prompt', () => {
+    expect(MONITOR).toMatch(/if \(decision\.next\.firstSeenAt === null\) \{\s*paneMenuState\.delete\(t\.session\)[\s\S]{0,160}clearPermissionPromptAlert\(t\.session\)/)
   })
 })
