@@ -136,6 +136,42 @@ export function setOverride(key: string, rawValue: unknown): SetOverrideResult {
   return { ok: true }
 }
 
+export interface ClearOverrideResult {
+  ok: boolean
+  /** false when there was no override to remove (the call is idempotent). */
+  removed: boolean
+  error?: string
+}
+
+// The inverse of setOverride: drops the key from config-overrides.json, so the
+// value falls back to the next layer (.env, then the registry default). Before
+// this existed an override could only be replaced, never removed -- so a value
+// saved once kept shadowing the registry default for good, including a default
+// a later release changed, and the only way back was editing the file by hand.
+// Same atomic write as setOverride; an unreadable overrides file is refused
+// rather than rewritten, because "read as empty" plus a write would silently
+// drop every other key in it.
+export function clearOverride(key: string): ClearOverrideResult {
+  const def = getSettingDefinition(key)
+  if (!def) return { ok: false, removed: false, error: `Ismeretlen kulcs: ${key}` }
+
+  ensureWatching()
+  const file = readOverridesFile()
+  if (file.state === 'unreadable') {
+    return { ok: false, removed: false, error: `A config-overrides.json nem olvasható (${file.cause ?? 'ismeretlen ok'}), ezért nem írom felül.` }
+  }
+  if (!(key in file.values)) {
+    cache = file.values
+    return { ok: true, removed: false }
+  }
+  const next = { ...file.values }
+  delete next[key]
+  mkdirSync(STORE_DIR, { recursive: true })
+  atomicWriteFileSync(OVERRIDES_PATH, JSON.stringify(next, null, 2))
+  cache = next
+  return { ok: true, removed: true }
+}
+
 // Test-only escape hatch: forces the in-memory cache back to whatever is
 // currently on disk (or empty if absent), bypassing the watch debounce.
 export function reloadOverridesForTest(): void {

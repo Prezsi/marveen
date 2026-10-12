@@ -14729,6 +14729,7 @@ async function loadSettings() {
       for (const def of defs) {
         group.appendChild(buildSettingRow(def))
       }
+      buildSettingsGroupReset(group)
       panel.appendChild(group)
       tabPanels.appendChild(panel)
     }
@@ -14762,6 +14763,7 @@ async function loadSettings() {
         for (const def of securityDefs) {
           group.appendChild(buildSettingRow(def))
         }
+        buildSettingsGroupReset(group)
         panel.appendChild(group)
       }
       tabPanels.appendChild(panel)
@@ -14843,6 +14845,7 @@ async function loadSettings() {
         for (const def of claudePlansDefs) {
           group.appendChild(buildSettingRow(def))
         }
+        buildSettingsGroupReset(group)
         panel.appendChild(group)
       }
 
@@ -15604,6 +15607,7 @@ function buildSettingRow(def) {
   }
   if (def.type === 'color') metaParts.push(t('settings.meta.format') + ': #rrggbb')
   metaParts.push(t('settings.meta.default') + ': ' + def.default)
+  if (def.source === 'override') metaParts.push(t('settings.meta.overridden'))
   meta.textContent = metaParts.join(' · ')
   info.appendChild(meta)
 
@@ -15659,8 +15663,184 @@ function buildSettingRow(def) {
   valueInput.addEventListener('input', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
   valueInput.addEventListener('change', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
 
+  // A value saved from this page is an override (config-overrides.json), and
+  // until now it could only be replaced, never removed. The button drops the
+  // override; the row is rebuilt from the answer so the input, the dirty
+  // tracking and the button itself all reflect the layer that answers now.
+  if (def.source === 'override') {
+    const resetBtn = document.createElement('button')
+    resetBtn.type = 'button'
+    resetBtn.className = 'btn-secondary btn-compact settings-reset-default-btn'
+    resetBtn.textContent = t('settings.btn.reset_default')
+    resetBtn.title = t('settings.btn.reset_default_title')
+    resetBtn.addEventListener('click', () => resetSettingToDefault(def, row, resetBtn, errorEl))
+    editor.insertBefore(resetBtn, errorEl)
+  }
+
+  row._settingDef = def
   row.appendChild(editor)
   return row
+}
+
+// Removes one saved override and rebuilds its row from the answer. Shared by
+// the row button and the per-tab button; reports instead of toasting so the
+// caller decides what to tell the operator.
+async function removeSettingOverride(row) {
+  const def = row._settingDef
+  const errorEl = row.querySelector('.settings-row-error')
+  if (errorEl) errorEl.textContent = ''
+  try {
+    const res = await fetch('/api/settings/' + encodeURIComponent(def.key), { method: 'DELETE' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (errorEl) errorEl.textContent = data.error || 'Hiba'
+      return { ok: false }
+    }
+    settingsDirty.delete(def.key)
+    row.replaceWith(buildSettingRow({ ...def, value: data.value, source: data.source }))
+    return { ok: true, source: data.source, requiresRestart: !!data.requiresRestart }
+  } catch {
+    if (errorEl) errorEl.textContent = 'Kapcsolati hiba'
+    return { ok: false }
+  }
+}
+
+async function resetSettingToDefault(def, row, btn, errorEl) {
+  btn.disabled = true
+  const group = row.closest('.settings-group')
+  const result = await removeSettingOverride(row)
+  if (!result.ok) {
+    btn.disabled = false
+    return
+  }
+  refreshSettingsGroupReset(group)
+  updateSettingsSaveBar()
+  loadClaudePlansReadiness()
+  const base = result.source === 'env' ? t('settings.toast.reset_env') : t('settings.toast.reset_default')
+  showToast(result.requiresRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+}
+
+// One button per tab: every overridden row of this group back to its default.
+// It changes several values at once, so it is confirmed, and the question
+// lists the keys -- the operator approves a named set, not "everything here".
+function overriddenSettingRows(group) {
+  return [...group.querySelectorAll('.settings-row')].filter((r) => r._settingDef && r._settingDef.source === 'override')
+}
+
+function buildSettingsGroupReset(group) {
+  const bar = document.createElement('div')
+  bar.className = 'settings-group-actions'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'btn-secondary btn-compact settings-reset-tab-btn'
+  btn.addEventListener('click', () => resetSettingsGroupToDefault(group))
+  bar.appendChild(btn)
+  group.prepend(bar)
+  refreshSettingsGroupReset(group)
+}
+
+function refreshSettingsGroupReset(group) {
+  const btn = group ? group.querySelector('.settings-reset-tab-btn') : null
+  if (!btn) return
+  const count = overriddenSettingRows(group).length
+  btn.disabled = count === 0
+  btn.textContent = count === 0 ? t('settings.btn.reset_tab') : t('settings.btn.reset_tab') + ' (' + count + ')'
+  btn.title = count === 0 ? t('settings.btn.reset_tab_none') : t('settings.btn.reset_tab_title')
+}
+
+// The confirmation for the per-tab reset, in the app's own modal (the native
+// confirm() carries the host name as its title and cannot show a list as a
+// list). Resolves true only on the explicit confirm button; Escape, the close
+// button, the backdrop and Cancel all resolve false, and Cancel has the focus,
+// so Enter on a freshly opened dialog changes nothing.
+function confirmSettingsReset(keys) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-overlay active'
+    overlay.setAttribute('role', 'dialog')
+    overlay.setAttribute('aria-modal', 'true')
+
+    const modal = document.createElement('div')
+    modal.className = 'modal'
+
+    const header = document.createElement('div')
+    header.className = 'modal-header'
+    const title = document.createElement('h2')
+    title.textContent = t('settings.confirm.reset_tab_title')
+    const closeBtn = document.createElement('button')
+    closeBtn.type = 'button'
+    closeBtn.className = 'modal-close'
+    closeBtn.textContent = '\u00d7'
+    header.append(title, closeBtn)
+
+    const body = document.createElement('div')
+    body.className = 'modal-body settings-reset-confirm'
+    const message = document.createElement('p')
+    message.textContent = t('settings.confirm.reset_tab')
+    const list = document.createElement('ul')
+    list.className = 'settings-reset-confirm-keys'
+    for (const key of keys) {
+      const item = document.createElement('li')
+      item.textContent = key
+      list.appendChild(item)
+    }
+    const actions = document.createElement('div')
+    actions.className = 'settings-reset-confirm-actions'
+    const cancelBtn = document.createElement('button')
+    cancelBtn.type = 'button'
+    cancelBtn.className = 'btn-secondary'
+    cancelBtn.textContent = t('common.cancel')
+    const okBtn = document.createElement('button')
+    okBtn.type = 'button'
+    okBtn.className = 'btn-primary'
+    okBtn.textContent = t('settings.confirm.reset_tab_ok')
+    actions.append(cancelBtn, okBtn)
+    body.append(message, list, actions)
+
+    modal.append(header, body)
+    overlay.appendChild(modal)
+
+    const finish = (answer) => {
+      document.removeEventListener('keydown', onKey)
+      overlay.remove()
+      resolve(answer)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') finish(false) }
+    document.addEventListener('keydown', onKey)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(false) })
+    closeBtn.addEventListener('click', () => finish(false))
+    cancelBtn.addEventListener('click', () => finish(false))
+    okBtn.addEventListener('click', () => finish(true))
+
+    document.body.appendChild(overlay)
+    cancelBtn.focus()
+  })
+}
+
+async function resetSettingsGroupToDefault(group) {
+  const rows = overriddenSettingRows(group)
+  if (rows.length === 0) return
+  const keys = rows.map((r) => r._settingDef.key)
+  if (!(await confirmSettingsReset(keys))) return
+
+  const btn = group.querySelector('.settings-reset-tab-btn')
+  if (btn) btn.disabled = true
+  let failed = 0
+  let needsRestart = false
+  for (const row of rows) {
+    const result = await removeSettingOverride(row)
+    if (!result.ok) failed++
+    else if (result.requiresRestart) needsRestart = true
+  }
+  refreshSettingsGroupReset(group)
+  updateSettingsSaveBar()
+  loadClaudePlansReadiness()
+  if (failed) {
+    showToast(t('settings.toast.reset_tab_partial'), 6000)
+  } else {
+    const base = t('settings.toast.reset_tab')
+    showToast(needsRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+  }
 }
 
 async function saveAllSettings() {
@@ -15687,6 +15867,14 @@ async function saveAllSettings() {
       } else {
         input.dataset.originalValue = String(raw)
         if (data.requiresRestart) needsRestart = true
+        // The saved value is an override now: rebuild the row so it offers
+        // "reset to default" without a page reload.
+        const savedRow = input.closest('.settings-row')
+        if (savedRow && savedRow._settingDef) {
+          const rebuilt = buildSettingRow({ ...savedRow._settingDef, value: data.value ?? raw, source: 'override' })
+          savedRow.replaceWith(rebuilt)
+          refreshSettingsGroupReset(rebuilt.closest('.settings-group'))
+        }
       }
     } catch {
       errorEl.textContent = 'Kapcsolati hiba'

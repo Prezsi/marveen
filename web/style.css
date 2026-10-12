@@ -6396,6 +6396,34 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 /* === Settings page === */
 .settings-group { margin-bottom: 28px; }
 .settings-group:last-child { margin-bottom: 0; }
+.settings-reset-confirm p {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.settings-reset-confirm-keys {
+  list-style: none;
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  max-height: 40vh;
+  overflow-y: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.settings-reset-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.settings-group-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 10px;
+}
 .settings-group-title {
   font-size: 13px;
   font-weight: 600;
