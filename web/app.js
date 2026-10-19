@@ -886,6 +886,11 @@ async function loadKanban() {
         if (sortSel) sortSel.value = storedSort
       }
     }
+    // Best effort and in parallel: the board must still load when the status
+    // endpoint is slow or fails; it just shows no live markers then.
+    const agentStatusP = fetch('/api/agents/status')
+      .then((r) => (r.ok ? r.json() : []))
+      .catch(() => [])
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('/api/kanban'),
       fetch('/api/kanban/assignees'),
@@ -896,6 +901,7 @@ async function loadKanban() {
     kanbanAssignees = await assigneesRes.json()
     kanbanProjects = await projectsRes.json()
     kanbanAllLabels = await labelsRes.json()
+    setKanbanAgentStatus(await agentStatusP)
     populateProjectFilter()
     populateProjectSuggestions()
     setupAssigneeFilter()
@@ -1553,6 +1559,66 @@ function updateSubtaskBadges(embeddedSubtaskIds) {
   }
 }
 
+// Live agent state on the card (one human, many agents). An in_progress card
+// says an agent CLAIMED the work; it does not say the agent is still on it --
+// a stopped or stuck agent's card looks exactly like a moving one. The state is
+// already derived per agent by /api/agents/status (src/web/agent-status.ts), so
+// the board borrows that instead of guessing anything from the card itself.
+// The state belongs to the AGENT, not to the card: an agent holding two cards
+// in progress shows the same marker on both. 'unknown' renders nothing --
+// saying nothing beats asserting a state nobody measured.
+let kanbanAgentStatus = new Map()
+
+const KANBAN_AGENT_LIVE_LEVEL = {
+  working: 'ok',
+  idle: 'idle',
+  stalled: 'warn',
+  dead: 'bad',
+  stopped: 'bad',
+  unreachable: 'bad',
+}
+
+function setKanbanAgentStatus(rows) {
+  kanbanAgentStatus = new Map()
+  if (!Array.isArray(rows)) return
+  for (const r of rows) {
+    if (r && typeof r.agent === 'string') kanbanAgentStatus.set(r.agent.trim().toLowerCase(), r)
+  }
+}
+
+// An agent with several cards in progress is busy on at most one of them. When
+// the status names a DIFFERENT card as the agent's current work, 'working' and
+// 'stalled' would be false on this one, so it says where the agent is instead,
+// in grey. Stopped/dead/unreachable are true for every card the agent holds.
+function kanbanAgentLiveLevel(card) {
+  if (card.status !== 'in_progress' || !card.assignee) return null
+  const row = kanbanAgentStatus.get(String(card.assignee).trim().toLowerCase())
+  if (!row) return null
+  const level = KANBAN_AGENT_LIVE_LEVEL[row.state]
+  if (!level) return null
+  const otherCardId = row.work && row.work.kind === 'card' && row.work.cardId && row.work.cardId !== card.id
+    ? row.work.cardId
+    : null
+  if (otherCardId && (row.state === 'working' || row.state === 'stalled')) {
+    return { level: 'idle', row, elsewhere: kanbanCards.find((c) => c.id === otherCardId) || null }
+  }
+  return { level, row, elsewhere: null }
+}
+
+function kanbanAgentLiveBadge(card) {
+  const live = kanbanAgentLiveLevel(card)
+  if (!live) return ''
+  const { level, row, elsewhere } = live
+  const label = elsewhere
+    ? t('kanban.agent_live.elsewhere', { seq: elsewhere.seq != null ? '#' + elsewhere.seq : '' })
+    : t('kanban.agent_live.' + row.state)
+  let tip = t('kanban.agent_live.tooltip', { state: label })
+  if (typeof row.lastSignalAgeSec === 'number') {
+    tip += ' · ' + t('kanban.agent_live.last_signal', { age: formatDurationShort(row.lastSignalAgeSec) })
+  }
+  return `<span class="kanban-card-agent-live kanban-agent-live-${escapeAttr(level)}" data-agent-state="${escapeAttr(row.state)}" title="${escapeAttr(tip)}"><span class="kanban-agent-live-dot"></span>${escapeHtml(label)}</span>`
+}
+
 function createCardEl(card, embeddedChildren = []) {
   const el = document.createElement('div')
   el.className = 'kanban-card'
@@ -1563,6 +1629,8 @@ function createCardEl(card, embeddedChildren = []) {
   // a move that looks like it failed. So the card is simply not draggable
   // there; the touch path reads the same flag.
   el.draggable = kanbanSortBy === 'manual'
+  const agentLive = kanbanAgentLiveLevel(card)
+  if (agentLive) el.dataset.agentLive = agentLive.level
 
   // Assignee chip. Match the card's assignee against the known list
   // case-insensitively (a card stored as "gorcsevivan" must still match the
@@ -1674,7 +1742,7 @@ function createCardEl(card, embeddedChildren = []) {
   el.innerHTML = `
     ${projectHtml}
     <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
-    <div class="kanban-card-footer">${assigneeHtml}${dueHtml}${blockedHtml}</div>
+    <div class="kanban-card-footer">${assigneeHtml}${kanbanAgentLiveBadge(card)}${dueHtml}${blockedHtml}</div>
     ${labelsHtml}
     <div class="kanban-card-actions">
       <button class="card-breakdown-btn" title="${t('kanban.btn.breakdown')}" aria-label="${t('kanban.btn.breakdown')}">⚡</button>
@@ -2172,6 +2240,58 @@ async function renderCardLabelsSection(card) {
 // Renders both directions from one GET: what this card waits on, and what waits
 // on it. The reverse list is read-only on purpose -- a block is removed from the
 // card that carries it, so there is exactly one place to clear each link.
+// Card 0f21864e (#568): the assignee's token use while this card was
+// in_progress. The number is an upper bound when the agent had other cards
+// in_progress at the same time, and the text says so instead of splitting it.
+function formatTokenCount(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k'
+  return String(n)
+}
+
+async function renderCardTokensSection(card) {
+  const box = document.getElementById('cardDetailTokens')
+  const body = document.getElementById('cardDetailTokensBody')
+  if (!box || !body) return
+  box.hidden = true
+  body.textContent = ''
+  let data
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/tokens`)
+    if (!r.ok) return
+    data = await r.json()
+  } catch { return }
+  if (!data || !data.agent || !Array.isArray(data.windows) || data.windows.length === 0) return
+  const lines = []
+  if (data.totalCalls === 0) {
+    lines.push(t('kanban.tokens.none'))
+  } else {
+    // Cache reads dominate the raw sum (96-98% on 4 live cards), so the
+    // headline names the three kinds instead of one big number.
+    lines.push(t('kanban.tokens.total', {
+      output: formatTokenCount(data.outputTokens),
+      fresh: formatTokenCount(data.freshInputTokens),
+      cached: formatTokenCount(data.cacheReadTokens),
+      calls: data.totalCalls,
+    }))
+    for (const m of data.perModel) {
+      lines.push(`${m.model || '?'}: ${t('kanban.tokens.model_line', { output: formatTokenCount(m.outputTokens), calls: m.calls })}`)
+    }
+  }
+  if (data.overlappingCards > 0) lines.push(t('kanban.tokens.overlap', { n: data.overlappingCards }))
+  const lastTo = data.windows[data.windows.length - 1].to
+  if (data.dataUntil && data.dataUntil < lastTo) {
+    lines.push(t('kanban.tokens.data_until', { time: new Date(data.dataUntil * 1000).toLocaleString() }))
+  }
+  for (const line of lines) {
+    const div = document.createElement('div')
+    div.textContent = line
+    body.appendChild(div)
+  }
+  box.title = t('kanban.tokens.tooltip', { agent: data.agent })
+  box.hidden = false
+}
+
 async function renderCardBlockersSection(card) {
   const listEl = document.getElementById('cardBlockerList')
   const addSelect = document.getElementById('cardBlockerAdd')
@@ -2459,6 +2579,7 @@ async function showCardDetail(card) {
 
   renderCardLabelsSection(card)
   renderCardBlockersSection(card)
+  renderCardTokensSection(card)
 
   // #115: Parent meta row — dropdown replaces the old read-only display; shown only when editable
   const parentMetaItem = document.getElementById('parentMetaItem')
@@ -4425,12 +4546,29 @@ function updateProcessControl(agent) {
   }
 }
 
+// RESTARTFORCEUI1018: the server refuses a manual main restart while the pane is busy or unreadable (409
+// restart-blocked, manual-restart-gate.ts), so a click never cuts a running turn by accident. A stuck main
+// agent can read busy for good, so the refusal is not the end: a second confirm sends an explicit force.
+function postMarveenRestart(force) {
+  return force
+    ? fetch('/api/marveen/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) })
+    : fetch('/api/marveen/restart', { method: 'POST' })
+}
+
 document.getElementById('marveenRestartBtn').addEventListener('click', async () => {
   if (!confirm(t('agents.confirm.hard_restart'))) return
   const btn = document.getElementById('marveenRestartBtn')
   btn.disabled = true
   try {
-    const res = await fetch('/api/marveen/restart', { method: 'POST' })
+    let res = await postMarveenRestart(false)
+    if (res.status === 409) {
+      const blocked = await res.clone().json().catch(() => ({}))
+      if (blocked.error === 'restart-blocked') {
+        const key = blocked.reason === 'busy' ? 'agents.confirm.force_restart_busy' : 'agents.confirm.force_restart_unreadable'
+        if (!confirm(t(key))) { showToast(t('agents.toast.restart_not_forced')); return }
+        res = await postMarveenRestart(true)
+      }
+    }
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
       throw new Error(err.error || t('agents.toast.restart_failed'))
@@ -18388,10 +18526,19 @@ async function fedApplyToMainAgent() {
     // so the client does not depend on window._marveen being loaded (the
     // Federation page does not populate it -> the old /api/agents/:name path
     // 404'd when it fell back to the 'marveen' default).
-    const res = await fetch('/api/federation/apply', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    // FEDAPPLYGATE1018: the apply restarts the main agent, so the server's busy gate applies; a refusal
+    // asks a second time, like the main restart button, and only then sends an explicit force.
+    const apply = (force) => fetch('/api/federation/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: force ? JSON.stringify({ force: true }) : '{}',
     })
-    const data = await res.json().catch(() => ({}))
+    let res = await apply(false)
+    let data = await res.json().catch(() => ({}))
+    if (res.status === 409 && data.error === 'restart-blocked') {
+      const key = data.reason === 'busy' ? 'agents.confirm.force_restart_busy' : 'agents.confirm.force_restart_unreadable'
+      if (!confirm(t(key))) { showToast(t('agents.toast.restart_not_forced')); return }
+      res = await apply(true)
+      data = await res.json().catch(() => ({}))
+    }
     if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
     showToast(t('federation.toast.applied'))
   } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }

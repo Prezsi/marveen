@@ -1,6 +1,8 @@
 import { PERMISSION_ALERT_MARKS } from '../config.js'
 import { logger } from '../logger.js'
 import { isPermissionFileCardTitle, permissionPromptSummary } from '../pane-state.js'
+import type { AlertMeta } from '../notify.js'
+import { escalatePermissionPrompt, type PermPromptAction, type PermPromptEscalationState } from './permission-prompt-escalation.js'
 
 // PERMFLOOD1012: an unanswered tool-permission prompt is ONE open question, so
 // it gets one message and then thinning reminders -- not one message per
@@ -28,9 +30,11 @@ import { isPermissionFileCardTitle, permissionPromptSummary } from '../pane-stat
  * The first mark is deliberately not zero. Most prompts are answered by an
  * owner who is at the pane already (a supervised batch of skill edits is a
  * prompt every few minutes), and a message about a question they are looking
- * at is noise. Ten minutes unanswered is the first sign that nobody is.
+ * at is noise. On a sub-agent's pane the first mark is also the main agent's
+ * head start (card 68cb6715, permission-prompt-escalation.ts): it is told at
+ * first sight, the owner 15 minutes later if nobody answered.
  */
-export const DEFAULT_PERMISSION_ALERT_MARKS = '10m,30m,1h,2h,8h,24h'
+export const DEFAULT_PERMISSION_ALERT_MARKS = '15m,30m,1h,2h,8h,24h'
 const MAX_MARK_MS = 30 * 24 * 60 * 60 * 1000
 const MARK_UNIT_MS: Record<string, number> = { s: 1000, m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 }
 
@@ -306,14 +310,27 @@ export function nextPermissionPromptAlert(
 export interface PermissionPromptPassDeps {
   /** The same pane with scrollback (agent-process capturePaneWithHistory). */
   captureWithHistory: (session: string) => string | null
-  /** Where an alert goes (channel-monitor sendAlert). */
-  send: (text: string) => void
+  /** The owner alert (channel-monitor sendAlert). */
+  send: (text: string, meta: AlertMeta) => void
+  /**
+   * The main agent, told first on a sub-agent's prompt (card 68cb6715): enqueues
+   * an inter-agent message, throws when it cannot. Without it (and on the main
+   * agent's own pane) only the owner is told, at the marks.
+   */
+  messageMainAgent?: (text: string) => void
+  /** This session is the main agent's own. */
+  isMainAgent?: boolean
+  /** Who was told about which prompt, per session; dropped with the menu spell. */
+  escalation?: Map<string, PermPromptEscalationState>
 }
+
+const ownEscalation = new Map<string, PermPromptEscalationState>()
 
 /**
  * Everything the menu pass does for a session parked on a permission prompt,
  * apart from the keystrokes it does not send: read the card with scrollback,
- * decide, and alert when a mark is reached. Returns whether it alerted.
+ * decide, tell the main agent on a new round, and alert the owner when a mark
+ * is reached. Returns who was told on this pass.
  *
  * It lives here rather than inline in channel-monitor.ts so that its behaviour
  * is under test: review of #1907 showed that with the logic at the call site,
@@ -327,18 +344,35 @@ export function runPermissionPromptPass(
   deps: PermissionPromptPassDeps,
   now: number = Date.now(),
   marks: readonly number[] = configured.marks,
-): boolean {
-  const text = nextPermissionPromptAlert(label, session, pane, deps.captureWithHistory(session) ?? pane, now, marks)
-  if (text == null) return false
-  deps.send(text)
-  return true
+): PermPromptAction {
+  const deep = deps.captureWithHistory(session) ?? pane
+  const ownerText = nextPermissionPromptAlert(label, session, pane, deep, now, marks)
+  const ask = permissionPromptAsk(pane, deep)
+  const state = states.get(session) as PermissionReminderState
+  const age = now - state.firstSeenAt
+  return escalatePermissionPrompt(deps.escalation ?? ownEscalation, {
+    session,
+    label,
+    isMainAgent: deps.isMainAgent === true || deps.messageMainAgent == null,
+    ask,
+    signature: state.id,
+    now,
+    ownerText,
+    fallbackOwnerText: formatPermissionPromptAlert(label, session, ask, age, permissionReminderDueAt(state.sent + 1, marks) - age),
+    ownerAfterMs: marks[0],
+  }, {
+    messageMainAgent: (text) => { deps.messageMainAgent?.(text) },
+    alertOwner: (text, meta) => { deps.send(text, meta) },
+  })
 }
 
 /** The prompt is gone (answered, or the session left the menu): forget it. */
 export function clearPermissionPromptAlert(session: string): void {
   states.delete(session)
+  ownEscalation.delete(session)
 }
 
 export function resetPermissionPromptAlerts(): void {
   states.clear()
+  ownEscalation.clear()
 }

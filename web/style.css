@@ -1557,7 +1557,11 @@ main {
 }
 .card-detail-test-steps.is-testing h4 { color: var(--accent, #7c9cff); }
 
+/* Card 0f21864e (#568): tokens per card, same heading style as the labels. */
+.card-detail-tokens { margin-bottom: 20px; }
+.card-detail-tokens-body { font-size: 13px; color: var(--text); display: grid; gap: 2px; }
 .card-detail-labels { margin-bottom: 20px; }
+.card-detail-tokens h4,
 .card-detail-labels h4 {
   font-size: 12px;
   font-weight: 600;
@@ -7988,6 +7992,24 @@ body {
   background: color-mix(in srgb, #f59e0b 18%, transparent);
   border: 1px solid color-mix(in srgb, #f59e0b 45%, transparent);
 }
+
+/* Live agent state on an in_progress card. The colour is the AGENT's state, not
+   the card's: green working, yellow possibly stuck, red stopped/dead, grey idle. */
+.kanban-card-agent-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+}
+.kanban-agent-live-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.kanban-agent-live-ok { color: #15803d; }
+.kanban-agent-live-warn { color: #b45309; }
+.kanban-agent-live-bad { color: #b91c1c; font-weight: 600; }
+.kanban-card[data-agent-live="bad"] { box-shadow: inset 3px 0 0 #dc2626; }
 
 /* MEMKERESVAK917: the memory search is forgiving -- when nothing matches the
    query as asked it answers with the rescued near-misses, and in the LIST those

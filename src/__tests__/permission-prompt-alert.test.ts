@@ -106,9 +106,9 @@ function runTicks(untilMs: number, marks?: readonly number[], id = 'q'): number[
 }
 
 describe('parsePermissionAlertMarks: the configurable schedule', () => {
-  it('the shipped default is 10 min, 30 min, 1 h, 2 h, 8 h, 24 h', () => {
-    expect(DEFAULT_PERMISSION_ALERT_MARKS).toBe('10m,30m,1h,2h,8h,24h')
-    expect(DEFAULT_PERMISSION_REMINDER_MARKS_MS.map((m) => m / MIN)).toEqual([10, 30, 60, 120, 480, 1440])
+  it('the shipped default is 15 min, 30 min, 1 h, 2 h, 8 h, 24 h', () => {
+    expect(DEFAULT_PERMISSION_ALERT_MARKS).toBe('15m,30m,1h,2h,8h,24h')
+    expect(DEFAULT_PERMISSION_REMINDER_MARKS_MS.map((m) => m / MIN)).toEqual([15, 30, 60, 120, 480, 1440])
   })
 
   it('empty means the default, and is not an error', () => {
@@ -405,12 +405,12 @@ describe('decidePermissionReminder: one question, thinning reminders', () => {
     expect(d.next).toEqual({ id: 'q', firstSeenAt: 1000, sent: 0 })
   })
 
-  it('a prompt answered inside ten minutes never produces a message', () => {
-    expect(runTicks(5 * MIN)).toEqual([])
+  it('a prompt answered inside fifteen minutes never produces a message', () => {
+    expect(runTicks(10 * MIN)).toEqual([])
   })
 
   it('speaks at each mark, then once per last-mark period', () => {
-    expect(runTicks(80 * HOUR)).toEqual([10, 30, 60, 120, 480, 1440, 2880, 4320])
+    expect(runTicks(80 * HOUR)).toEqual([15, 30, 60, 120, 480, 1440, 2880, 4320])
   })
 
   it('the measured incident (04:19 -> 12:14, 95 ticks) is 4 messages, not 95', () => {
@@ -419,21 +419,21 @@ describe('decidePermissionReminder: one question, thinning reminders', () => {
 
   it('a DIFFERENT question starts its own clock', () => {
     let state = decidePermissionReminder(undefined, 'q1', 0).next
-    state = decidePermissionReminder(state, 'q1', 10 * MIN).next
+    state = decidePermissionReminder(state, 'q1', 15 * MIN).next
     expect(state.sent).toBe(1)
-    const d = decidePermissionReminder(state, 'q2', 15 * MIN)
+    const d = decidePermissionReminder(state, 'q2', 20 * MIN)
     expect(d.send).toBe(false)
-    expect(d.next).toEqual({ id: 'q2', firstSeenAt: 15 * MIN, sent: 0 })
-    expect(decidePermissionReminder(d.next, 'q2', 25 * MIN).send).toBe(true)
+    expect(d.next).toEqual({ id: 'q2', firstSeenAt: 20 * MIN, sent: 0 })
+    expect(decidePermissionReminder(d.next, 'q2', 35 * MIN).send).toBe(true)
   })
 
   it('a message reports the age and the distance to the next mark', () => {
     const first = decidePermissionReminder(undefined, 'q', 0)
-    const d = decidePermissionReminder(first.next, 'q', 10 * MIN)
+    const d = decidePermissionReminder(first.next, 'q', 15 * MIN)
     expect(d.send).toBe(true)
     if (d.send) {
-      expect(d.waitingMs).toBe(10 * MIN)
-      expect(d.nextGapMs).toBe(20 * MIN)
+      expect(d.waitingMs).toBe(15 * MIN)
+      expect(d.nextGapMs).toBe(15 * MIN)
     }
   })
 
@@ -441,7 +441,7 @@ describe('decidePermissionReminder: one question, thinning reminders', () => {
     const first = decidePermissionReminder(undefined, 'q', 0)
     const late = decidePermissionReminder(first.next, 'q', 3 * HOUR)
     expect(late.send).toBe(true)
-    expect(late.next.sent).toBe(4) // 10 min, 30 min, 1 h and 2 h are all behind us
+    expect(late.next.sent).toBe(4) // 15 min, 30 min, 1 h and 2 h are all behind us
     expect(decidePermissionReminder(late.next, 'q', 3 * HOUR + 5 * MIN).send).toBe(false)
     expect(decidePermissionReminder(late.next, 'q', 8 * HOUR).send).toBe(true)
   })
@@ -451,7 +451,7 @@ describe('decidePermissionReminder: one question, thinning reminders', () => {
     const skewed = decidePermissionReminder(first.next, 'q', 1 * HOUR)
     expect(skewed.send).toBe(false)
     expect(skewed.next.firstSeenAt).toBe(1 * HOUR)
-    expect(decidePermissionReminder(skewed.next, 'q', 1 * HOUR + 10 * MIN).send).toBe(true)
+    expect(decidePermissionReminder(skewed.next, 'q', 1 * HOUR + 15 * MIN).send).toBe(true)
   })
 
   it('a configured schedule is honoured, and its last mark is the repeat period', () => {
@@ -531,11 +531,11 @@ describe('nextPermissionPromptAlert: the monitor-facing half', () => {
   const ask = (session: string, deep: string, now: number, marks?: readonly number[]) =>
     nextPermissionPromptAlert(session === 'suzy-channels' ? 'Suzy' : 'Alfa', session, EDIT_PROMPT, deep, now, marks)
 
-  it('default schedule: silent on sight, speaks at ten minutes with the path, then waits for the next mark', () => {
+  it('default schedule: silent on sight, speaks at fifteen minutes with the path, then waits for the next mark', () => {
     expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 0, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toBeNull()
-    expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 5 * MIN, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toBeNull()
-    expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 10 * MIN, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toContain('Ezt kérdezi: „Edit file: ../.claude/skills/example-skill/SKILL.md”')
-    expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 15 * MIN, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toBeNull()
+    expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 10 * MIN, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toBeNull()
+    expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 15 * MIN, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toContain('Ezt kérdezi: „Edit file: ../.claude/skills/example-skill/SKILL.md”')
+    expect(ask('suzy-channels', EDIT_PROMPT_DEEP, 20 * MIN, DEFAULT_PERMISSION_REMINDER_MARKS_MS)).toBeNull()
   })
 
   it('a second, different edit of the same file is a new question', () => {
@@ -579,26 +579,26 @@ describe('runPermissionPromptPass: the behaviour of the menu pass branch', () =>
 
   it('one alert at the first mark, none inside the window, one at the next mark', () => {
     const h = harness()
-    expect(h.pass(0)).toBe(false)
-    expect(h.pass(5 * MIN)).toBe(false)
+    expect(h.pass(0)).toBe('wait')
+    expect(h.pass(5 * MIN)).toBe('wait')
+    expect(h.pass(10 * MIN)).toBe('wait')
     expect(h.sent).toHaveLength(0)
 
-    expect(h.pass(10 * MIN)).toBe(true)
+    expect(h.pass(15 * MIN)).toBe('notify-owner')
     expect(h.sent).toHaveLength(1)
 
-    expect(h.pass(15 * MIN)).toBe(false)
-    expect(h.pass(20 * MIN)).toBe(false)
-    expect(h.pass(25 * MIN)).toBe(false)
+    expect(h.pass(20 * MIN)).toBe('wait')
+    expect(h.pass(25 * MIN)).toBe('wait')
     expect(h.sent).toHaveLength(1)
 
-    expect(h.pass(30 * MIN)).toBe(true)
+    expect(h.pass(30 * MIN)).toBe('notify-owner')
     expect(h.sent).toHaveLength(2)
   })
 
   it('never alerting is a failure, not a quiet success', () => {
     const h = harness()
     for (let t = 0; t <= 24 * HOUR; t += 5 * MIN) h.pass(t)
-    expect(h.sent.length).toBe(6) // 10 min, 30 min, 1 h, 2 h, 8 h, 24 h
+    expect(h.sent.length).toBe(6) // 15 min, 30 min, 1 h, 2 h, 8 h, 24 h
   })
 
   it('alerting on every pass is the flood again', () => {
@@ -625,14 +625,14 @@ describe('runPermissionPromptPass: the behaviour of the menu pass branch', () =>
 
   it('a failed scrollback capture falls back to the visible pane instead of going silent', () => {
     const h = harness(null)
-    expect(h.pass(0, [0, 30 * MIN])).toBe(true)
+    expect(h.pass(0, [0, 30 * MIN])).toBe('notify-owner')
     expect(h.sent).toHaveLength(1)
   })
 
   it('after the prompt clears nothing is sent, and a later prompt starts its own clock', () => {
     const h = harness()
     h.pass(0)
-    h.pass(10 * MIN)
+    h.pass(15 * MIN)
     expect(h.sent).toHaveLength(1)
 
     // The owner answers; the menu spell ends and the monitor forgets the prompt.
@@ -640,10 +640,10 @@ describe('runPermissionPromptPass: the behaviour of the menu pass branch', () =>
 
     // The same edit is asked again two hours later. Without the clear it would
     // inherit the old clock: 2 h is past four marks, so it would alert at once.
-    expect(h.pass(2 * HOUR)).toBe(false)
-    expect(h.pass(2 * HOUR + 5 * MIN)).toBe(false)
+    expect(h.pass(2 * HOUR)).toBe('wait')
+    expect(h.pass(2 * HOUR + 10 * MIN)).toBe('wait')
     expect(h.sent).toHaveLength(1)
-    expect(h.pass(2 * HOUR + 10 * MIN)).toBe(true)
+    expect(h.pass(2 * HOUR + 15 * MIN)).toBe('notify-owner')
     expect(h.sent).toHaveLength(2)
   })
 })
@@ -660,8 +660,9 @@ describe('channel-monitor is wired to it', () => {
     expect(branch).toContain('PERMDENY905')
   })
 
-  it('it runs the pass with the scrollback capture and the real alert sink', () => {
-    expect(branch).toMatch(/runPermissionPromptPass\(label, t\.session, paneNow, \{ captureWithHistory: capturePaneWithHistory, send: sendAlert \}\)/)
+  it('it runs the pass with the scrollback capture, the main agent and the real alert sink', () => {
+    expect(branch).toMatch(/runPermissionPromptPass\(label, t\.session, paneNow, \{\s*captureWithHistory: capturePaneWithHistory,\s*escalation: permPromptState,\s*isMainAgent: t\.isMarveen,\s*messageMainAgent: \(text\) => \{ createAgentMessage\('system', MAIN_AGENT_ID, text\) \},\s*send: \(text, meta\) => sendAlert\(text, meta\),\s*\}\)/)
+    expect(branch.match(/sendAlert\(/g) ?? []).toHaveLength(1)
   })
 
   it('it sends nothing itself: no second alert path beside the pass, and no keystroke', () => {

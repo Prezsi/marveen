@@ -9,7 +9,7 @@ import {
   getKanbanSeqByIdPrefix,
   listLabels, getLabel, createLabel, updateLabel, deleteLabel,
   addLabelToCard, removeLabelFromCard, getLabelsForAllCards, getLabelsForCard,
-  addCardBlocker, removeCardBlocker, getBlockersForCard, getBlockedByCard,
+  addCardBlocker, removeCardBlocker, getBlockersForCard, getBlockedByCard, getCardsUnblockedBy, getLatestDoneTransitionAt,
   getBlockersForAllCards, blockerWouldCycle, parentWouldCycle,
   listArchivedKanbanCards,
   revertIdeaFromKanban,
@@ -27,6 +27,7 @@ import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
 import { isAgentRunning } from '../agent-process.js'
 import { resolveKanbanDispatch } from '../../kanban-dispatch.js'
 import { generateBreakdown } from '../llm-breakdown.js'
+import { getCardTokenUsage } from '../token-usage.js'
 import { logger } from '../../logger.js'
 import { MAX_LABEL_PALETTE_ENTRIES, resolveLabelColor } from '../../css-color.js'
 import { readBody, json, jsonMaybeGzip, methodNotAllowed } from '../http-helpers.js'
@@ -283,6 +284,84 @@ function reportUndeliveredDispatch(id: string, unreachable: string): void {
   } catch (err) {
     logger.warn({ err, id }, 'Undelivered-dispatch inbox notice failed')
   }
+}
+
+// Card 08bf8326 (#567): a hand-off between agents is a blocker link ("B waits on A").
+// When A reaches done and B has nothing else open to wait on, B's assignee is
+// told once, so the next agent does not sit idle until somebody looks at the
+// board. Every freed card also gets a system comment, so a human assignee (who
+// gets no prompt) sees it on the board too.
+//
+// Rules, the same resolver as the dispatch: the human owner and unknown names get
+// no message; the agent that closed A is not told about its own card; a sub-agent
+// whose session is down is reported to the main agent instead, like an
+// undelivered dispatch. Card titles stay out of the message (free text written by
+// anyone); the assignee reads them from the board.
+//
+// Best-effort: runs after the move already succeeded, so it never throws.
+//
+// Once per closing (PR2027SCRIPTNOTIFY1018): a freed card that already carries
+// this blocker's system comment from the current done transition on is skipped.
+// The /move and the PUT call this once per transition anyway; the dedupe is for
+// the second entry point, POST /api/kanban/:id/notify-unblocked, which the card
+// script calls after its own DB move and which a caller may repeat.
+function notifyUnblockedCards(blockerId: string, actor?: string | null): { freed: string[]; alreadyNotified: string[] } {
+  const result = { freed: [] as string[], alreadyNotified: [] as string[] }
+  let freed: ReturnType<typeof getCardsUnblockedBy>
+  try {
+    freed = getCardsUnblockedBy(blockerId)
+  } catch (err) {
+    logger.warn({ err, blockerId }, 'Unblock lookup failed (card move still succeeded)')
+    return result
+  }
+  if (freed.length === 0) return result
+  const blocker = getKanbanCard(blockerId)
+  const blockerRef = blocker?.seq ? `#${blocker.seq}` : `(${blockerId})`
+  const commentText = `A(z) ${blockerRef} kártya kész lett, és ez volt az utolsó, amire ez a kártya várt. Folytatható.`
+  const closedAt = getLatestDoneTransitionAt(blockerId) ?? 0
+  for (const card of freed) {
+    const cardRef = card.seq ? `#${card.seq}` : `(${card.id})`
+    if (getKanbanComments(card.id).some((c) => c.author === 'system' && c.content === commentText && c.created_at >= closedAt)) {
+      result.alreadyNotified.push(card.id)
+      continue
+    }
+    result.freed.push(card.id)
+    try {
+      addKanbanComment(card.id, 'system', commentText)
+    } catch (err) {
+      logger.warn({ err, id: card.id }, 'Unblock card comment failed')
+    }
+    try {
+      const decision = resolveKanbanDispatch(card.assignee, {
+        ownerName: OWNER_NAME,
+        botName: BOT_NAME,
+        mainAgentId: MAIN_AGENT_ID,
+        agentNames: listAgentNames(),
+        isRunning: isAgentRunning,
+        actor,
+      })
+      if (!DISPATCH_SAFE_CARD_ID_RE.test(card.id) || !DISPATCH_SAFE_CARD_ID_RE.test(blockerId)) continue
+      if (decision.target) {
+        createAgentMessage(
+          MAIN_AGENT_ID,
+          decision.target,
+          `[Kanban feloldva #${card.id}] A(z) ${cardRef} kártyád már nem vár semmire: a(z) ${blockerRef} (#${blockerId}) kész lett. ` +
+          `Nézd meg a táblán, és ha te jössz, húzd in_progress-re.`,
+        )
+        logger.info({ id: card.id, blockerId, target: decision.target }, 'Kanban unblock notice sent')
+      } else if (decision.reason === 'session-down') {
+        createAgentMessage(
+          'system',
+          MAIN_AGENT_ID,
+          `[kanban-feloldva] A(z) ${cardRef} (#${card.id}) kártya felszabadult (a(z) ${blockerRef} kész), ` +
+          `de a felelőse (${decision.unreachable}) nem fut, ezért nem kapott üzenetet.`,
+        )
+      }
+    } catch (err) {
+      logger.warn({ err, id: card.id, blockerId }, 'Kanban unblock notice failed (card move still succeeded)')
+    }
+  }
+  return result
 }
 
 // HBKANBANDRIFT819: the heartbeat-summary payload, shaped so that TRUNCATED
@@ -603,6 +682,15 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
+  // --- Tokens per card (card 0f21864e, #568): what the assignee spent while it was in_progress ---
+  const cardTokensMatch = path.match(/^\/api\/kanban\/([^/]+)\/tokens$/)
+  if (cardTokensMatch && method === 'GET') {
+    const usage = getCardTokenUsage(decodeURIComponent(cardTokensMatch[1]), { botName: BOT_NAME, mainAgentId: MAIN_AGENT_ID })
+    if (!usage) { json(res, { error: 'Kártya nem található' }, 404); return true }
+    json(res, usage)
+    return true
+  }
+
   // --- Blockers: "this card is blocked by that card" ---
   // GET returns both directions in one payload. The reverse list (what waits on
   // THIS card) is the half that changes behaviour: it is what tells the operator
@@ -771,7 +859,13 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     // PUT to in_progress clears but does not dispatch; /move remains the only
     // dispatch path (KARTYADISPATCH1010). updateKanbanCard applies the shared
     // dispatched_at clear; no fireKanbanDispatch call belongs here.
-    if (updateKanbanCard(id, data, who.actor)) { json(res, { ok: true, ...archivedNote(getKanbanCard(id)) }); return true }
+    const statusBefore = getKanbanCard(id)?.status
+    if (updateKanbanCard(id, data, who.actor)) {
+      const after = getKanbanCard(id)
+      if (statusBefore !== 'done' && after?.status === 'done') notifyUnblockedCards(id, who.actor)
+      json(res, { ok: true, ...archivedNote(after) })
+      return true
+    }
     json(res, { error: 'Kártya nem található' }, 404)
     return true
   }
@@ -781,6 +875,45 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     revertIdeaFromKanban(id)
     if (deleteKanbanCard(id)) { json(res, { ok: true }); return true }
     json(res, { error: 'Kártya nem található' }, 404)
+    return true
+  }
+
+  // PR2027SCRIPTNOTIFY1018: the unblock notice for a card closed OUTSIDE this
+  // route. The card script (scripts/kartya-es-ertesites.py) moves cards in the DB
+  // directly, so the /move and PUT hooks above never see its closings -- measured
+  // on the fleet's board: 127 of 127 transitions to done came through it. The
+  // script calls this right after its move, and the rules stay here, in one place.
+  // Only a card that IS done is accepted; a repeated call does not notify twice.
+  const unblockNotifyMatch = path.match(/^\/api\/kanban\/([^/]+)\/notify-unblocked$/)
+  if (unblockNotifyMatch && method === 'POST') {
+    const id = decodeURIComponent(unblockNotifyMatch[1])
+    const raw = (await readBody(req)).toString().trim()
+    let parsed: unknown = {}
+    if (raw !== '') {
+      try { parsed = JSON.parse(raw) } catch { json(res, { error: 'Body must be JSON' }, 400); return true }
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      json(res, { error: 'Body must be a JSON object. Accepted fields: actor' }, 400)
+      return true
+    }
+    const unknownKeys = Object.keys(parsed).filter((k) => k !== 'actor')
+    if (unknownKeys.length > 0) {
+      json(res, { error: `Unknown field(s): ${unknownKeys.join(', ')}. Accepted: actor` }, 400)
+      return true
+    }
+    const who = kanbanWriteActor((parsed as { actor?: unknown }).actor, ctx.auth)
+    if ('error' in who) {
+      json(res, { error: who.error }, 400)
+      return true
+    }
+    const card = getKanbanCard(id)
+    if (!card) { json(res, { error: 'Kártya nem található' }, 404); return true }
+    if (card.status !== 'done') {
+      json(res, { error: 'card_not_done', current_status: card.status }, 409)
+      return true
+    }
+    const result = notifyUnblockedCards(id, who.actor)
+    json(res, { ok: true, freed: result.freed, already_notified: result.alreadyNotified })
     return true
   }
 
@@ -817,11 +950,16 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
       json(res, { error: who.error }, 400)
       return true
     }
+    const statusBeforeMove = getKanbanCard(id)?.status
     if (moveKanbanCard(id, status, sort_order ?? 0, who.actor, hasExpected ? { expectedStatus: expected_status as Parameters<typeof moveKanbanCard>[1] } : undefined)) {
       // Wake the assigned agent once when the card enters in_progress -- unless
       // that agent is the one who moved it (self-pickup needs no wake-up).
       if (status === 'in_progress') fireKanbanDispatch(id, who.actor)
-      json(res, { ok: true, ...archivedNote(getKanbanCard(id)) })
+      // A reorder inside the done column is not a closing: only a real
+      // transition to done frees the cards waiting on this one.
+      const moved = getKanbanCard(id)
+      if (statusBeforeMove !== 'done' && moved?.status === 'done') notifyUnblockedCards(id, who.actor)
+      json(res, { ok: true, ...archivedNote(moved) })
       return true
     }
     // Nothing changed: a missing card stays the old 404; an existing card means
