@@ -362,10 +362,13 @@ describe('the card summary never quotes the command echo', () => {
   // description -- so the last quoted block is the command on an ordinary
   // card, not only on a cut one. Measured on this capture with the build
   // before this fix: the token and the whole command were in the sent text.
+  // The fake token in the file is shortened after the capture (the live one
+  // was 24 characters, the secret gate's bearer threshold); nothing else moved.
   it('the live 2.1.303 Bash card: the header goes out, the command does not, to either recipient', () => {
     const live = fixture('permission-prompt-bash-main-2.1.303.txt')
+    const LIVE_TOKEN = 'sk-live-FAKE-0001'
     expect(detectsPermissionDialog(live)).toBe(true)
-    expect(live).toContain(` │ printf %s\\\\n "Authorization: Bearer ${TOKEN}"`)
+    expect(live).toContain(` │ printf %s\\\\n "Authorization: Bearer ${LIVE_TOKEN}"`)
     expect(permissionPromptSummary(live)).toBeNull()
     expect(permissionPromptAsk(live)).toBe('Bash command')
     resetPermissionPromptAlerts()
@@ -380,7 +383,7 @@ describe('the card summary never quotes the command echo', () => {
     expect(owner).toHaveLength(1)
     for (const text of [...main, ...owner]) {
       expect(text).toContain('Bash command')
-      for (const part of [TOKEN, 'Authorization', 'printf', 'ls -d /tmp']) expect(text).not.toContain(part)
+      for (const part of [LIVE_TOKEN, 'Authorization', 'printf', 'ls -d /tmp']) expect(text).not.toContain(part)
     }
   })
 

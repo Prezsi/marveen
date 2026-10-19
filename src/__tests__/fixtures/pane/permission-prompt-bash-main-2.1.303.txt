@@ -4,9 +4,9 @@
 
 
 ❯ Run exactly this one bash command and nothing else, do not explain: printf %s\\n "Authorization: Bearer
-  sk-live-AAAABBBBCCCCDDDD" > /dev/null && cd /tmp && ls -d /tmp
+  sk-live-FAKE-0001" > /dev/null && cd /tmp && ls -d /tmp
 
-● Bash(printf %s\\n "Authorization: Bearer sk-live-AAAABBBBCCCCDDDD" > /dev/null && cd /tmp && ls -d /tmp)
+● Bash(printf %s\\n "Authorization: Bearer sk-live-FAKE-0001" > /dev/null && cd /tmp && ls -d /tmp)
   ⎿  Waiting…
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -14,7 +14,7 @@
  Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
  Run the user's requested command
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
- │ printf %s\\n "Authorization: Bearer sk-live-AAAABBBBCCCCDDDD" > /dev/null && cd /tmp && ls -d /tmp
+ │ printf %s\\n "Authorization: Bearer sk-live-FAKE-0001" > /dev/null && cd /tmp && ls -d /tmp
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
  Do you want to proceed?
  ❯ 1. Yes
