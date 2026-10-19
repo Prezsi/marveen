@@ -1,6 +1,6 @@
 import { PERMISSION_ALERT_MARKS } from '../config.js'
 import { logger } from '../logger.js'
-import { permissionPromptSummary } from '../pane-state.js'
+import { isPermissionFileCardTitle, permissionPromptSummary } from '../pane-state.js'
 
 // PERMFLOOD1012: an unanswered tool-permission prompt is ONE open question, so
 // it gets one message and then thinning reminders -- not one message per
@@ -71,21 +71,27 @@ export const DEFAULT_PERMISSION_REMINDER_MARKS_MS: readonly number[] = parsePerm
 // scrollback in the capture, an earlier line of the transcript may quote the
 // same words.
 const PERMISSION_QUESTION_LINE_RX = /\bDo you want to [^?\n]{1,200}\?/i
-const PERMISSION_CARD_RULE_RX = /^\s*─{8,}\s*$/
+const PERMISSION_CARD_RULE_RX = /^─{8,}\s*$/
 const PERMISSION_CARD_DASH_RX = /^\s*[╌┄-]{8,}\s*$/
-// "Edit file", "Write file", "Bash command": a short capitalised label. The
-// shape guard matters because the capture may reach past the card, where the
-// nearest rule above the question belongs to something else entirely.
-const PERMISSION_CARD_TITLE_RX = /^[A-Z][A-Za-z]+(?: [A-Za-z]+){0,3}$/
-// The cards whose second line is a PATH: "Edit file", "Create file" (both
-// measured), and any other "<Verb> file". Only on these is the line under the
-// header quoted. On every other card -- a Bash card above all -- that line is
-// the COMMAND, and a command line can carry a literal token
-// (`curl -H "Authorization: Bearer ..."`); the alert goes out to a chat channel
-// and has never carried command text. Review of #1907 fed this module exactly
-// such a card and got the token back in the ask. An allowlist, not a redaction
-// pass: what is never quoted cannot leak in a shape nobody thought to redact.
-const PERMISSION_FILE_CARD_TITLE_RX = /^[A-Z][a-z]+ file$/
+// "Edit file", "Write file", "Bash command": a short capitalised label, with
+// the suffix a sub-agent's card carries ("Bash command · from the
+// general-purpose agent", both live Bash captures). The shape guard matters
+// because the capture may reach past the card, where the nearest rule above
+// the question belongs to something else entirely.
+const PERMISSION_CARD_TITLE_RX = /^[A-Z][A-Za-z]+(?: [A-Za-z]+){0,3}(?: · from the \S+(?: \S+){0,3} agent)?$/
+// Only on a "<Verb> file" card (isPermissionFileCardTitle, pane-state.ts) is
+// the line under the header quoted: it is a path. On every other card -- a
+// Bash card above all -- that line is the COMMAND, and a command line can
+// carry a literal token (`curl -H "Authorization: Bearer ..."`); the alert
+// goes out to a chat channel and has never carried command text. Review of
+// #1907 fed this module exactly such a card and got the token back in the ask.
+// An allowlist, not a redaction pass: what is never quoted cannot leak in a
+// shape nobody thought to redact. The card summary (step 1 below) applies the
+// same rule to its reason block, in pane-state.ts, so that every message built
+// from it -- not only this one -- gets it.
+// A sub-agent's card draws its subject quoted ("   │ ~/.claude/..."); the
+// quote bar is layout, not part of the path.
+const PERMISSION_SUBJECT_QUOTE_RX = /^│\s?/
 const PERMISSION_ASK_MAX = 260
 const PERMISSION_IDENTITY_MAX = 1500
 
@@ -132,7 +138,7 @@ function readPermissionCard(pane: string): PermissionCard | null {
     const head = lines.slice(ruleIdx + 1, questionIdx).map((l) => l.trim()).filter(Boolean)
     if (head.length >= 2 && PERMISSION_CARD_TITLE_RX.test(head[0]) && !PERMISSION_CARD_DASH_RX.test(head[1])) {
       title = head[0]
-      subject = head[1]
+      subject = head[1].replace(PERMISSION_SUBJECT_QUOTE_RX, '').trim() || null
     }
   }
   const from = title != null ? ruleIdx + 1 : Math.max(0, questionIdx - 40)
@@ -149,7 +155,9 @@ function capAsk(text: string): string {
  * One line saying what the prompt asks, or null when nothing readable is on
  * the pane. In order of how much each says:
  *   1. the tool card summary (title + the reason Claude gives), when the card
- *      has a reason block;
+ *      has a reason block that permissionPromptSummary can tell apart from
+ *      the command echo (on a reason-less card the last quoted block IS the
+ *      command, so there is no summary and this step is skipped);
  *   2. on a file card, the header and the path ("Edit file: <path>"), which
  *      needs `deepPane` whenever the edit is longer than the screen;
  *   3. on any other card, the header alone ("Bash command") -- never the line
@@ -162,7 +170,7 @@ export function permissionPromptAsk(pane: string | null | undefined, deepPane: s
   if (summary) return capAsk(`${summary.title} -- ${summary.reason}`)
   const card = readPermissionCard(deepPane || pane || '')
   if (!card) return null
-  if (card.title && card.subject && PERMISSION_FILE_CARD_TITLE_RX.test(card.title)) {
+  if (card.title && card.subject && isPermissionFileCardTitle(card.title)) {
     return capAsk(`${card.title}: ${card.subject}`)
   }
   // Any other card with a readable header: the header alone ("Bash command").

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { detectsPermissionDialog } from '../pane-state.js'
+import { detectsPermissionDialog, permissionPromptSummary } from '../pane-state.js'
 import {
   DEFAULT_PERMISSION_ALERT_MARKS,
   DEFAULT_PERMISSION_REMINDER_MARKS_MS,
@@ -199,6 +199,202 @@ describe('a command line never reaches the alert', () => {
   it('only a "<Verb> file" card has its second line quoted', () => {
     const fileCard = BASH_NO_REASON.replace(' Bash command', ' Edit file').replace(/   curl .*/, ' src/app.ts').replace('proceed?', 'make this edit to app.ts?')
     expect(permissionPromptAsk(fileCard)).toBe('Edit file: src/app.ts')
+  })
+})
+
+// Review of #1907, second round: the card summary (step 1 of permissionPromptAsk)
+// ran BEFORE the header guard above, and its reason is the LAST quoted block
+// before the question. On a real sub-agent Bash card the command echo is a
+// quoted block too, so on a card without a reason block the "reason" was the
+// command. Measured on the live capture with its reason block cut and a token
+// in the command: the token was in the sent text. The summary is shared (the
+// router's stuck-session and STOP-hold messages read it, and so does the
+// main-agent message of #2055), so the guard sits in pane-state.ts and is
+// tested here end to end, through the pass the menu runs.
+describe('the card summary never quotes the command echo', () => {
+  const TOKEN = 'sk-live-AAAABBBBCCCCDDDD'
+  const RULE = '─'.repeat(60)
+  // The live bash-grep capture, a literal token added to its command.
+  const WITH_REASON = BASH_PROMPT.replace('&& grep -n\n', `&& grep -n ${TOKEN}\n`)
+  // (A) The same card without its reason block.
+  const NO_REASON = WITH_REASON.replace(/\n │ grep on\n[\s\S]*?running it anyway\.\n/, '')
+  // (C) ...and without the description line under the command.
+  const NO_REASON_NO_DESC = NO_REASON.replace('   Locate the functions\n', '')
+  // Every piece of the command echo. 'ExampleController' is left out on
+  // purpose: the reason of the live capture names that file itself.
+  const COMMAND_PARTS = [TOKEN, 'cd /Users', 'OPERATOR', 'example-wt', 'grep -n', 'firstSymbol', 'fourthSy', 'mbol', 'fifthSymbol', 'func transition']
+
+  function sentFor(pane: string, deep: string | null = pane): string[] {
+    resetPermissionPromptAlerts()
+    const sent: string[] = []
+    runPermissionPromptPass('Suzy', 'agent-sub', pane, { captureWithHistory: () => deep, send: (text) => { sent.push(text) } }, 0, [0, 10 * MIN])
+    return sent
+  }
+
+  it('the cut cards are still permission prompts, with the token in the command and no reason left', () => {
+    for (const pane of [NO_REASON, NO_REASON_NO_DESC]) {
+      expect(detectsPermissionDialog(pane)).toBe(true)
+      expect(pane).toContain(`   │ cd /Users/OPERATOR/Developer/Projects/example-wt && grep -n ${TOKEN}`)
+      expect(pane).not.toContain('deny rule is configured')
+    }
+    expect(NO_REASON_NO_DESC).not.toContain('Locate the functions')
+  })
+
+  it('(B) with the reason block: the reason reaches the sent text, the command does not', () => {
+    const sent = sentFor(WITH_REASON)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toContain('Bash command · from the general-purpose agent -- grep on')
+    expect(sent[0]).toContain('a Read() deny rule is configured')
+    for (const part of COMMAND_PARTS) expect(sent[0]).not.toContain(part)
+  })
+
+  it.each([['(A) reason block cut', NO_REASON], ['(C) reason block and description cut', NO_REASON_NO_DESC]])(
+    '%s: an alert still goes out, no part of the command reaches it, and it names the card',
+    (_name, pane) => {
+      const sent = sentFor(pane)
+      expect(sent).toHaveLength(1)
+      for (const part of COMMAND_PARTS) expect(sent[0]).not.toContain(part)
+      expect(sent[0]).not.toContain('Locate the functions')
+      // What is left is the header alone: what kind of thing waits, and for whom.
+      expect(sent[0]).toContain('Ezt kérdezi: „Bash command · from the general-purpose agent”')
+    },
+  )
+
+  it('the shared summary has nothing to quote on such a card, so no message built from it can carry the command', () => {
+    expect(permissionPromptSummary(NO_REASON)).toBeNull()
+    expect(permissionPromptSummary(NO_REASON_NO_DESC)).toBeNull()
+    expect(permissionPromptSummary(WITH_REASON)?.reason).toMatch(/^grep on 'src\/Example\/ExampleController\.swift' after a cd/)
+  })
+
+  it('two quoted runs at one indent are not command + reason: neither is quoted', () => {
+    // One command drawn in two runs (a blank line between) has the shape of
+    // "two blocks", but both are the command; on every live capture the
+    // reason block sits LEFT of the command echo.
+    const split = NO_REASON.replace('fourthSy\n', 'fourthSy\n\n')
+    expect(permissionPromptSummary(split)).toBeNull()
+    for (const part of COMMAND_PARTS) expect(sentFor(split)[0]).not.toContain(part)
+  })
+
+  it("quoted lines in the transcript above the card are not the card's reason", () => {
+    // A card with no quoted block of its own (the main agent's Bash card, as in
+    // the synthetic cards above) under transcript that has two, shaped like an
+    // echo and a reason.
+    const pane = [
+      '● The last prompt read:',
+      '    │ curl https://example.invalid/deploy',
+      '',
+      `  │ export API_KEY=${TOKEN}`,
+      '',
+      RULE,
+      ' Bash command',
+      '',
+      '   ./deploy.sh',
+      '',
+      ' Do you want to proceed?',
+      ' ❯ 1. Yes',
+      '   2. No, and tell Claude what to do differently (esc)',
+      '',
+      ' Esc to cancel',
+    ].join('\n')
+    expect(detectsPermissionDialog(pane)).toBe(true)
+    expect(permissionPromptSummary(pane)).toBeNull()
+    expect(permissionPromptAsk(pane)).toBe('Bash command')
+    expect(sentFor(pane)[0]).not.toContain(TOKEN)
+  })
+
+  it('a card cut off at the top of the visible pane: no guess from what is left, the header from the scrollback', () => {
+    // Without the header nothing says whether this is a file card, so the
+    // summary does not pick a block; the scrollback still has the header.
+    const lines = WITH_REASON.split('\n')
+    const visible = lines.slice(lines.findIndex((l) => l.includes('mbol\\|fifthSymbol'))).join('\n')
+    expect(visible).not.toContain('Bash command')
+    expect(visible).toContain(' │ grep on')
+    expect(permissionPromptSummary(visible)).toBeNull()
+    expect(permissionPromptAsk(visible, WITH_REASON)).toBe('Bash command · from the general-purpose agent')
+    // No scrollback at all: the question alone, which says nothing -- so no quote.
+    expect(permissionPromptAsk(visible.replace(/\n │ grep on\n[\s\S]*?running it anyway\.\n/, ''))).toBeNull()
+  })
+
+  describe('a sub-agent file card keeps what it quoted before', () => {
+    const SUB_EDIT = [
+      RULE,
+      ' Edit file · from the general-purpose agent',
+      '',
+      '   │ ~/.claude/skills/deploy/SKILL.md',
+      '   Update the rollback step',
+      '',
+      ' │ Claude wants to edit its own configuration',
+      '',
+      ' Do you want to make this edit?',
+      ' ❯ Yes, allow this edit',
+      '   No, tell Claude what to do differently',
+      '',
+      ' Esc to cancel · Tab to amend',
+    ].join('\n')
+
+    it('with a reason block: the reason', () => {
+      expect(permissionPromptAsk(SUB_EDIT)).toBe('Edit file · from the general-purpose agent -- Claude wants to edit its own configuration')
+    })
+
+    it('without one: the path, which a file card quotes anyway', () => {
+      const noReason = SUB_EDIT.replace(' │ Claude wants to edit its own configuration\n\n', '')
+      expect(permissionPromptAsk(noReason)).toBe('Edit file · from the general-purpose agent -- ~/.claude/skills/deploy/SKILL.md')
+    })
+
+    it('header off the visible pane: the path from the scrollback, without the quote bar', () => {
+      const visible = SUB_EDIT.split('\n').slice(4).join('\n')
+      expect(permissionPromptAsk(visible, SUB_EDIT)).toBe('Edit file · from the general-purpose agent: ~/.claude/skills/deploy/SKILL.md')
+    })
+  })
+
+  it('the status line above a sub-agent card is not part of the question', () => {
+    // With the "· from ... agent" header unrecognised, the identity was the 40
+    // lines above the question, the "Waiting for N background agents" line
+    // included, and a change there restarted the reminder clock.
+    const later = BASH_PROMPT.replace('Waiting for 2 background agents to finish', 'Waiting for 1 background agent to finish')
+    expect(later).not.toBe(BASH_PROMPT)
+    expect(permissionPromptIdentity(later)).toBe(permissionPromptIdentity(BASH_PROMPT))
+  })
+
+  // Shapes the two-block rule alone let through (measured on a prototype of
+  // it): each one put a token from the command into the summary.
+  describe('what the card body draws is not a reason', () => {
+    const CD = fixture('permission-prompt-compound-cd.txt')
+    const TAIL = [' Do you want to proceed?', ' ❯ 1. Yes', '   2. No', '', ' Esc to cancel · Tab to amend']
+
+    it('│ boxes the command draws, at a decreasing indent, are command text', () => {
+      const pane = ['', RULE, ' Bash command', '', "   cat > docs/arch.md <<'EOF'", '       ┌───────────┐', '       │ service A │', '       └───────────┘', '   ┌──────────────────────────────┐', `   │ API_KEY=${TOKEN} │`, '   └──────────────────────────────┘', '   EOF', '   Write the architecture note', '', ...TAIL].join('\n')
+      expect(detectsPermissionDialog(pane)).toBe(true)
+      expect(permissionPromptSummary(pane)).toBeNull()
+      expect(permissionPromptAsk(pane)).toBe('Bash command')
+    })
+
+    it('a ─ line inside the command is not the card rule', () => {
+      const quoted = ['', RULE, ' Bash command', '', "   cat > notes.txt <<'EOF'", '   ──────────────────', '   Edit file', `   │ export API_KEY=${TOKEN}`, '   EOF', '   Write notes', '', ...TAIL].join('\n')
+      const plain = quoted.replace(`   │ export API_KEY=${TOKEN}`, `   export API_KEY=${TOKEN}`)
+      expect(permissionPromptSummary(quoted)).toBeNull()
+      expect(permissionPromptAsk(quoted)).toBe('Bash command')
+      expect(permissionPromptAsk(plain)).toBe('Bash command')
+    })
+
+    it('a file card quotes its path line, never a quoted diff under it', () => {
+      const oneBox = ['', RULE, ' Edit file · from the general-purpose agent', '', '   │ ~/project/.env', '   │ ╌╌╌╌╌╌╌╌╌╌╌╌', '   │   3 -API_KEY=old', `   │   3 +API_KEY=${TOKEN}`, '', ' Do you want to make this edit to .env?', ' ❯ 1. Yes', '   2. No', '', ' Esc to cancel · Tab to amend'].join('\n')
+      const twoBoxes = oneBox.replace('   │ ╌╌╌╌╌╌╌╌╌╌╌╌', '   ╌╌╌╌╌╌╌╌╌╌╌╌')
+      for (const pane of [oneBox, twoBoxes]) {
+        expect(permissionPromptSummary(pane)).toEqual({ title: 'Edit file · from the general-purpose agent', reason: '~/project/.env' })
+        expect(permissionPromptAsk(pane)).not.toContain(TOKEN)
+      }
+    })
+
+    it('the question is the LAST one on the pane: the same words above the card do not move the anchor', () => {
+      const transcript = CD.replace('  The reviewer question before the merge is predictable: full target both sides. The', '  Do you want to proceed with the merge? The reviewer question is predictable. The')
+      expect(permissionPromptSummary(transcript)?.reason).toMatch(/^Compound command contains cd/)
+      // An earlier card in the scrollback, with a reason, above a card without one.
+      const stale = ['● Last time the prompt looked like this:', RULE, ' Bash command · from the general-purpose agent', '', '   │ curl https://example.invalid', '', ' │ Command contains a network request', '', ' Do you want to proceed?', '', CD.replace(/\n │ Compound command[\s\S]*?rule exists\n/, '\n')].join('\n')
+      expect(permissionPromptSummary(stale)).toBeNull()
+      const inCommand = CD.replace('   │ head\n', '   │ head; read -p "Do you want to proceed? " ans\n')
+      expect(permissionPromptSummary(inCommand)?.reason).toMatch(/^Compound command contains cd/)
+    })
   })
 })
 
