@@ -356,6 +356,34 @@ describe('the card summary never quotes the command echo', () => {
     expect(permissionPromptIdentity(later)).toBe(permissionPromptIdentity(BASH_PROMPT))
   })
 
+  // Captured live on Claude Code 2.1.303 (2026-10-19), a main agent's Bash card
+  // with a fake token in the command. This CLI draws the command echo as ONE
+  // quoted block at the title's column, between ╌ rules, under an unquoted
+  // description -- so the last quoted block is the command on an ordinary
+  // card, not only on a cut one. Measured on this capture with the build
+  // before this fix: the token and the whole command were in the sent text.
+  it('the live 2.1.303 Bash card: the header goes out, the command does not, to either recipient', () => {
+    const live = fixture('permission-prompt-bash-main-2.1.303.txt')
+    expect(detectsPermissionDialog(live)).toBe(true)
+    expect(live).toContain(` │ printf %s\\\\n "Authorization: Bearer ${TOKEN}"`)
+    expect(permissionPromptSummary(live)).toBeNull()
+    expect(permissionPromptAsk(live)).toBe('Bash command')
+    resetPermissionPromptAlerts()
+    const owner: string[] = []
+    const main: string[] = []
+    runPermissionPromptPass('Alfa', 'agent-alfa', live, {
+      captureWithHistory: () => live,
+      messageMainAgent: (text) => { main.push(text) },
+      send: (text) => { owner.push(text) },
+    }, 0, [0, 10 * MIN])
+    expect(main).toHaveLength(1)
+    expect(owner).toHaveLength(1)
+    for (const text of [...main, ...owner]) {
+      expect(text).toContain('Bash command')
+      for (const part of [TOKEN, 'Authorization', 'printf', 'ls -d /tmp']) expect(text).not.toContain(part)
+    }
+  })
+
   // Shapes the two-block rule alone let through (measured on a prototype of
   // it): each one put a token from the command into the summary.
   describe('what the card body draws is not a reason', () => {
