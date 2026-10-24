@@ -246,10 +246,14 @@ describe('the unsaved-input guard on a modal backdrop', () => {
   })
 })
 
-describe('kanban: the Hungarian texts say "alfeladat", not "subtask"', () => {
+describe('kanban: the Hungarian texts say "részfeladat", not "subtask" or "alfeladat"', () => {
   it.each(['kanban.modal.subtasks_title', 'kanban.breakdown.created_count', 'kanban.breakdown.accept_btn'])('%s', (key) => {
     const line = HU.split('\n').find((l) => l.includes(`'${key}':`)) ?? ''
-    expect(line).toMatch(/lfeladat/)
+    expect(line).toMatch(/észfeladat/)
     expect(line.slice(line.indexOf(':'))).not.toMatch(/subtask/i)
+  })
+
+  it('no Hungarian UI text says "alfeladat" any more', () => {
+    expect(HU).not.toMatch(/alfeladat/i)
   })
 })
