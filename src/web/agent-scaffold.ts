@@ -561,6 +561,39 @@ export function upgradeForeignRootInHookPrompts(existingHooks: Record<string, un
   return changed
 }
 
+/**
+ * In-place pass over an agent's hooks block: the template's
+ * PreCompact task-state curl now sends X-Agent-Id, so the agent's own record
+ * replays as its own. The add pass dedupes on COMMAND strings and never
+ * rewrites a `type: "agent"` prompt, so without this pass an agent scaffolded
+ * before the change would keep the header-less curl forever. Only the exact
+ * template spelling is upgraded; an operator-customised curl is left alone.
+ * Idempotent. Exported for unit tests.
+ */
+const TASKSTATE_CURL_ANCHOR = "/api/agent-taskstate/SAJAT_NEVED -H 'Content-Type: application/json'"
+const TASKSTATE_AGENT_HEADER = " -H 'X-Agent-Id: SAJAT_NEVED'"
+export function upgradeTaskStateHeaderInHookPrompts(existingHooks: Record<string, unknown>): boolean {
+  let changed = false
+  for (const entries of Object.values(existingHooks)) {
+    if (!Array.isArray(entries)) continue
+    for (const entry of entries as HookEntry[]) {
+      for (const hook of entry.hooks ?? []) {
+        if (typeof hook.prompt !== 'string' || !hook.prompt.includes(TASKSTATE_CURL_ANCHOR)) continue
+        const withHeader = TASKSTATE_CURL_ANCHOR + TASKSTATE_AGENT_HEADER
+        const upgraded = hook.prompt
+          .split(withHeader)
+          .map((part) => part.split(TASKSTATE_CURL_ANCHOR).join(withHeader))
+          .join(withHeader)
+        if (upgraded !== hook.prompt) {
+          hook.prompt = upgraded
+          changed = true
+        }
+      }
+    }
+  }
+  return changed
+}
+
 // Idempotent migration: every agent's settings.json should carry the
 // PreCompact hook (memory save + skill reflection). Pre-refactor agents
 // were scaffolded before scaffoldAgentDir seeded the template, so their
@@ -622,6 +655,8 @@ export function ensureAgentHooks(
     // HOSTMOVE923: an existing PreCompact prompt inherited from another
     // install/host names a dead root; the add pass below would never see it.
     if (upgradeForeignRootInHookPrompts(existingHooks, PROJECT_ROOT)) changed = true
+    // The same blind spot for the task-state curl's X-Agent-Id header.
+    if (upgradeTaskStateHeaderInHookPrompts(existingHooks)) changed = true
     // Matcher pass: a widened template matcher (e.g. SessionStart gaining
     // `clear`) must reach agents whose command string is unchanged.
     if (syncHookMatchers(existingHooks, tplHooks)) changed = true
@@ -1681,7 +1716,8 @@ export function injectTelegramCopyGate(existing: Record<string, unknown>): void 
 // spawn, so an edit the agent makes to that file in this session cannot loosen the running gate.
 const SENDER_ROLE_GATE_SCRIPT = 'sender-role-gate.py'
 
-// Sub-agents only: the main agent is out of scope on purpose.
+// Sub-agents only here: the main agent's gate rides its session-only --settings file instead
+// (main-extra-plugins-settings.ts), because the sub-agents read the install-root project settings.
 export function agentGetsSenderRoleGate(name: string): boolean {
   return name !== MAIN_AGENT_ID
 }
@@ -3312,6 +3348,67 @@ export function ensureMessageCloseSection(name: string): void {
 
   const updated = MSGCLOSE_BLOCK_RE.test(existing)
     ? existing.replace(MSGCLOSE_BLOCK_RE, block)
+    : existing.trimEnd() + '\n\n' + block + '\n'
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
+}
+
+// ---- Long background work: checkpoint and resume (BGCHECKPOINT1008) ----
+//
+// A key wall (the fleet key rotation) and an agent restart (context guard, key
+// rotation) stop a running background sub-agent and a run_in_background
+// command; the main conversation continues with --continue, the background
+// work does not, and whatever it had not written down is lost. Measured on one
+// install (2026-10-08): one wall stopped three long background sub-agents
+// (19-40 minutes, 279k-376k tokens each), all restarted from scratch. The rule
+// ships as a section because the reader is the agent at the moment it starts
+// long background work: save the partial result to a file about every ten
+// minutes, resume from it after the restart, and note on the card where it is.
+const BGCHECKPOINT_BEGIN = '<!-- BEGIN GENERATED: background-checkpoint (auto-generated, do not edit by hand) -->'
+const BGCHECKPOINT_END = '<!-- END GENERATED: background-checkpoint -->'
+const BGCHECKPOINT_BLOCK_RE = new RegExp(
+  `${BGCHECKPOINT_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${BGCHECKPOINT_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+export function buildBackgroundCheckpointBody(): string {
+  return [
+    '## Hosszú háttér-munka: menet közbeni mentés, folytatás a mentett részből',
+    '',
+    'A kulcsfal (kulcsváltás) és az újraindulás (context-guard, kulcsváltás) a futó háttér-alügynököt és a háttérben',
+    'futó parancsot leállítja: a fő beszélgetés folytatódik, a háttér-munka nem, és ami nincs fájlban, elvész.',
+    '',
+    '- Ha egy háttér-alügynök vagy háttér-futás várhatóan 15 percnél tovább dolgozik, kb. 10 percenként mentse a',
+    '  részeredményt fájlba, a munkakönyvtárad alatt (a scratchpad session-hez kötött /tmp-mappa: új session, például a',
+    '  context-guard friss indítása, vagy gép-újraindulás után nincs meg). A háttér-alügynök briefjébe ezt írd bele, a',
+    '  fájl útjával együtt.',
+    '- A mentésbe NE kerüljön titok, token vagy személyes adat; git által figyelmen kívül hagyott helyre (.gitignore-os almappa) menjen, soha ne olyan fájlba, ami commitba kerülhet.',
+    '- Újraindulás vagy kulcsfal után ELŐBB a mentett részt olvasd be, és onnan folytasd, ne elölről.',
+    '- A lapra (vagy a HANDOFF.md-be) egy sor: hol a mentett rész (út), és mi a következő lépés.',
+  ].join('\n')
+}
+
+// Idempotently ensures the background-checkpoint block is present and current
+// in the agent's CLAUDE.md; same contract as ensureMessageCloseSection, called
+// from the same two surfaces (web.ts for the main agent, agent-process.ts for
+// the rest), so an agent carries it from its next start on.
+export function ensureBackgroundCheckpointSection(name: string): void {
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(PROJECT_ROOT, 'CLAUDE.md')
+    : join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const block = `${BGCHECKPOINT_BEGIN}\n${buildBackgroundCheckpointBody()}\n${BGCHECKPOINT_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  const updated = BGCHECKPOINT_BLOCK_RE.test(existing)
+    ? existing.replace(BGCHECKPOINT_BLOCK_RE, block)
     : existing.trimEnd() + '\n\n' + block + '\n'
 
   if (updated === existing) return

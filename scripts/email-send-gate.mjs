@@ -31,7 +31,7 @@
 // writeAgentSettingsFromProfile() (agent-scaffold.ts), guarded by
 // name !== MAIN_AGENT_ID, and re-applied on every spawn (respawn-safe).
 
-import { closeSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs'
+import { closeSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -110,6 +110,26 @@ const ENV_ASSIGN = /^[A-Za-z_][A-Za-z_0-9]*=/
 // twin); the shared send-invocation-cases.json binds the two copies.
 const CMD_POSITION_KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!'])
 const SENDER_PROG = /^(sendmail|msmtp|swaks)$/i
+// MAILGATEAPIB1027: mail / mailx / s-nail send when given an address, a subject, a cc/bcc/from/attach option or
+// any operand (a recipient); with none of these (`mail`, `mail -f mbox`, `mail -u user`) they read mail.
+// Mirrors _MAIL_PROG / _mail_prog_sends in hooks/outgoing-copy-gate.py.
+const MAIL_PROG = /^(mail|mailx|s-nail)$/i
+const MAIL_SEND_OPT = /^-[A-Za-z]*[sbcrtaAq]/
+const CURL_SMTP = /^(?:smtps?:\/\/|--mail-(?:rcpt|from)(?:=|$))/i
+function mailProgSends(rest) {
+  let skip = false
+  for (const t of rest) {
+    if (skip) { skip = false; continue }
+    if (t.includes('@')) return true
+    if (t === '-f' || t === '-u') { skip = true; continue }
+    if (t.startsWith('-')) {
+      if (MAIL_SEND_OPT.test(t)) return true
+      continue
+    }
+    return true
+  }
+  return false
+}
 const SENDPY = /^send\.py$/i
 // SUBAGENTMAILGATE1016: a version-suffixed interpreter (python3.12, python3.13, and
 // the free-threaded python3.13t) is the same python; the old /^python3?$/ let it
@@ -214,8 +234,153 @@ const CODE_SEND_MODULE = new RegExp(
   // The same class on the Graph sender (export sendMail): renamed on import, or a string key.
   String.raw`|\bsendMail\s+as\b|\[\s*['"]sendMail['"]\s*\]`,
 )
-const codeStringSends = (code) =>
-  CODE_SEND.test(code) || CODE_SEND_MODULE.test(code) || (CODE_EXECISH.test(code) && CODE_SENDER_LIT.test(code))
+// MAILGATESCRIPT1027: a Microsoft Graph send endpoint (sendMail, or send/reply/replyAll/forward of a message)
+// MAILGATESCRIPT1027 R1: a send needs the endpoint shape AND Graph evidence in the same text (an application
+// route of the same shape is no send); `\/` is normalised to `/` first (JSON-escaped URLs).
+const GRAPH_SEND = /\/(?:me|users\/[^\n]{1,120}?)\/(?:sendMail(?![A-Za-z0-9_-]|[^\x00-\x7f])|messages\/[^\n]{1,160}?\/(?:send|reply|replyAll|forward)(?![A-Za-z0-9_-]|[^\x00-\x7f]))/i
+const GRAPH_EVIDENCE = /graph\.microsoft\.com|microsoft-graph-client|msgraph|\.api\s*\(/i
+const graphSends = (text) => {
+  const t = text.replaceAll('\\/', '/')
+  return GRAPH_SEND.test(t) && GRAPH_EVIDENCE.test(t)
+}
+// MAILGATEHTTPAPI1027: an HTTP mail API reached from a script (a Gmail REST send from urllib went past
+// the main agent's approval gate). Each provider needs its own evidence AND a send shape in the same
+// text, so a Gmail read or a text that only names the provider is no send. The evidence is a literal API
+// host or a client call or package name, never the bare provider word: after the `\/` normalisation a
+// gate's own regex source carries the shapes, and a gate file must not count as a sender. Mirrors
+// _MAIL_API_RULES in hooks/outgoing-copy-gate.py; hooks/mail-api-send-cases.json binds the two twins.
+const ACTION_END = String.raw`(?![A-Za-z0-9_-]|[^\x00-\x7f])`
+const MAIL_API_RULES = [
+  // Gmail: the REST host (also an assembled URL) or the client; the messages or drafts send call.
+  [/gmail\.googleapis\.com|[/]gmail[/]v1[/]|\bbuild\s*\(\s*['"]gmail['"]|\bgoogle\.gmail\s*\(|['"]@googleapis\/gmail['"]/i,
+    new RegExp(String.raw`\/(?:messages|drafts)\/send` + ACTION_END + String.raw`|\.(?:messages|drafts)\s*(?:\(\s*\))?\s*\.send\s*\(`, 'i')],
+  // Resend: the emails endpoint on the API host (and its batch), or the SDK's emails.send( on a client
+  // of any name (Samu 50950 A1: `const client = new Resend(k)`), the package being the evidence.
+  [/api\.resend\.com|['"]resend['"]|\bimport\s+resend\b/i,
+    new RegExp(String.raw`api\.resend\.com\/emails(?:\/batch)?` + ACTION_END + String.raw`|\.emails\.send\s*\(`, 'i')],
+  // SendGrid: v3 mail send on the API host, or the mail client.
+  [/api\.sendgrid\.com|['"]@sendgrid\/mail['"]|\bSendGridAPIClient\s*\(/i,
+    new RegExp(String.raw`api\.sendgrid\.com\/v3\/mail\/send` + ACTION_END + String.raw`|['"]@sendgrid\/mail['"]|\bSendGridAPIClient\s*\(`, 'i')],
+  // Mailgun: the API host with a v3 domain messages path (an assembled URL too), or the client's
+  // messages.create( next to the package name. A bare "/messages" is no evidence: the dashboard's own
+  // /api/messages is one.
+  [/mailgun\.net|['"]mailgun(?:\.js)?['"]/i,
+    new RegExp(String.raw`\/v3\/[^\n]{1,200}?\/messages(?:\.mime)?` + ACTION_END + String.raw`|\.messages\.create\s*\(`, 'i')],
+  // Postmark: the email endpoints on the API host (single, batch, with a template), or the SDKs (MAILGATEAPIB1027):
+  // the node client's sendEmail family, python postmarker's emails.send family.
+  [/api\.postmarkapp\.com|['"]postmark['"]|\bpostmarker\b/i,
+    new RegExp(String.raw`api\.postmarkapp\.com\/email(?:\/batch|\/withTemplate)?` + ACTION_END +
+      String.raw`|\.sendEmail(?:Batch|WithTemplate|BatchWithTemplates)?\s*\(|\.emails\.send(?:_batch|_with_template)?\s*\(`, 'i')],
+]
+const mailApiSends = (text) => {
+  const t = text.replaceAll('\\/', '/')
+  return MAIL_API_RULES.some(([evidence, send]) => evidence.test(t) && send.test(t))
+}
+// A Microsoft Graph send or an HTTP mail API send in a code string or a script file.
+const webMailSends = (text) => graphSends(text) || mailApiSends(text)
+// MAILGATEHEREDOCFP1027: a send marker that only sits in DATA is no send. The interpreter's code is read with its
+// prose blanked: a string literal whose text holds whitespace and every comment become spaces (length and line
+// breaks kept); a literal without whitespace (a URL, a package name, a 'sendmail' argv item) stays, and so do the
+// interpolations of a template literal or an f-string. An unterminated literal is left raw to the end of where the
+// scan stopped. Mirrors _mask_prose_literals in hooks/outgoing-copy-gate.py (see the rationale there);
+// hooks/prose-literal-cases.json binds the two.
+const PY_STR_PREFIX = /^(?:rb|br|fr|rf|r|b|u|f)$/i
+const isAlpha = (ch) => /^\p{L}$/u.test(ch)
+const isWordish = (ch) => /^[\p{L}\p{N}_]$/u.test(ch)
+const blankText = (s) => Array.from(s, (ch) => (ch === '\n' ? '\n' : ' ')).join('')
+export function maskProseLiterals(text, lang) {
+  if (lang !== 'py' && lang !== 'js') return text
+  const chars = Array.from(text)
+  const n = chars.length
+  const at = (k, s) => { for (let q = 0; q < s.length; q++) if (chars[k + q] !== s[q]) return false; return true }
+  const slice = (a, b) => chars.slice(a, b).join('')
+  // ASCII whitespace only, the same set in both twins (str.isspace and \s differ outside ASCII).
+  const isSpace = (ch) => ' \t\n\r\f\v'.includes(ch)
+  const out = []
+  let i = 0
+  while (i < n) {
+    const c = chars[i]
+    if ((lang === 'py' && c === '#') || (lang === 'js' && at(i, '//'))) {
+      let j = chars.indexOf('\n', i)
+      if (j === -1) j = n
+      out.push(blankText(slice(i, j)))
+      i = j
+      continue
+    }
+    if (lang === 'js' && at(i, '/*')) {
+      let j = -1
+      for (let k = i + 2; k < n - 1; k++) if (chars[k] === '*' && chars[k + 1] === '/') { j = k; break }
+      if (j === -1) { out.push(slice(i, n)); break }
+      out.push(blankText(slice(i, j + 2)))
+      i = j + 2
+      continue
+    }
+    if (c === "'" || c === '"' || (lang === 'js' && c === '`')) {
+      let prefix = ''
+      if (lang === 'py') {
+        let k = i
+        while (k > 0 && isAlpha(chars[k - 1]) && i - k < 2) k--
+        if (k < i && PY_STR_PREFIX.test(slice(k, i)) && (k === 0 || !isWordish(chars[k - 1]))) prefix = slice(k, i).toLowerCase()
+      }
+      const triple = lang === 'py' && at(i, c + c + c)
+      const quote = triple ? c + c + c : c
+      const interp = (lang === 'js' && c === '`') || prefix.includes('f')
+      const multiline = triple || (lang === 'js' && c === '`')
+      let j = i + quote.length
+      const parts = []
+      let buf = ''
+      let closed = false
+      while (j < n) {
+        const ch = chars[j]
+        if (ch === '\\' && j + 1 < n) { buf += ch + chars[j + 1]; j += 2; continue }
+        if (at(j, quote)) { closed = true; break }
+        if (ch === '\n' && !multiline) break
+        if (interp && ((lang === 'js' && at(j, '${')) || (lang === 'py' && ch === '{' && !at(j, '{{')))) {
+          const start = j + (lang === 'js' ? 2 : 1)
+          let depth = 1
+          let k = start
+          while (k < n && depth) {
+            if (chars[k] === '{') depth++
+            else if (chars[k] === '}') depth--
+            k++
+          }
+          if (depth) break
+          parts.push([false, buf])
+          buf = ''
+          parts.push([true, slice(j, k)])
+          j = k
+          continue
+        }
+        if (interp && lang === 'py' && at(j, '{{')) { buf += '{{'; j += 2; continue }
+        buf += ch
+        j++
+      }
+      if (!closed) {
+        // Raw up to where the scan stopped: its text is not read again as code (a `//` in it is no comment).
+        out.push(slice(i, j))
+        i = j
+        continue
+      }
+      parts.push([false, buf])
+      const prose = parts.some(([code, s]) => !code && Array.from(s).some(isSpace))
+      out.push(quote)
+      for (const [code, s] of parts) out.push(code || !prose ? s : blankText(s))
+      out.push(quote)
+      i = j + quote.length
+      continue
+    }
+    out.push(c)
+    i++
+  }
+  return out.join('')
+}
+// The masking language of an interpreter: python, a JS runtime, else none.
+const langOf = (prog) => (PYTHON.test(basename(prog)) ? 'py' : NODEISH.test(basename(prog)) ? 'js' : null)
+const codeStringSends = (code, lang = null) => {
+  const masked = maskProseLiterals(code, lang)
+  return CODE_SEND.test(masked) || CODE_SEND_MODULE.test(masked) || webMailSends(masked) ||
+    (CODE_EXECISH.test(masked) && CODE_SENDER_LIT.test(code))
+}
 
 // Unquoted newline / backtick / `$(` become segment separators; quoted text is
 // untouched (it is content). Tracks quote state by hand -- no shell involved.
@@ -445,6 +610,62 @@ function commandHeads(toksIn, d = 0) {
 const PY_OPT_WITH_ARG = new Set(['-X', '-W', '--check-hash-based-pycs'])
 const RECIPIENT_FLAG = /^--to?(=|$)/
 const UNDECIDABLE_PATH = /[*?[{$]/
+
+// FLEETTOFLAG1025 v4 (Merlin 34827; the python twin: _FLEET_EXEMPT_BLOCK / _known_agents / _fleet_to_exempt): no tokenizer reading
+// of the recipient value any more. On an UNDECIDABLE program or script the recipient flag is a send, EXCEPT when every --to / --to=
+// value is a KNOWN agent name (the install's agents/ directories and its MAIN_AGENT_ID) AND the WHOLE command line has no `@`, no `~`
+// word other than a `~/` path and no --cc / --bcc. Every other shape is a send (fail-closed).
+const FLEET_EXEMPT_BLOCK = /@|(?:^|[\s='"(])~(?!\/)|--b?cc\b/
+const FLEET_TOKEN_BLOCK = /^(?:--(?:cc?|bc{0,2})(?:=|$)|~(?!\/))/ // on the DEQUOTED words: `--c""c`, `--\cc` are `--cc` to the program;
+// (v4.1, Merlin 34962) an argparse abbreviation (--c, --b, --bc) is --cc / --bcc to a default-argparse script: a send
+const AGENT_NAME = /^[a-z0-9][a-z0-9_-]*$/
+let knownAgentsOverride = null // the shared conformance list sets it (send-invocation-cases.json known_agents); null = the install
+let lineExemptOk = false // set per top-level isSendInvocation call from the WHOLE command line
+export function setKnownAgentsOverride(list) { knownAgentsOverride = list == null ? null : new Set(list) }
+const tok = (t) => t.replace(/^\n+|\n+$/g, '')
+const recipientFlag = (t) => RECIPIENT_FLAG.test(tok(t))
+// the agent names of THIS install: <root>/agents/* directories and MAIN_AGENT_ID in <root>/.env (root = one level above this
+// file). Any read error = an empty set, i.e. no exception (fail-closed).
+function knownAgents() {
+  if (knownAgentsOverride !== null) return knownAgentsOverride
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const names = new Set()
+  try {
+    const d = join(root, 'agents')
+    for (const e of readdirSync(d, { withFileTypes: true })) if (e.isDirectory() && AGENT_NAME.test(e.name)) names.add(e.name)
+  } catch { /* no agents/ directory: only the main agent can be known */ }
+  try {
+    const m = readFileSync(join(root, '.env'), 'utf-8').match(/^\s*MAIN_AGENT_ID\s*=\s*['"]?([^'"\s#]+)/m)
+    if (m && AGENT_NAME.test(m[1])) names.add(m[1])
+  } catch { /* no .env: the main agent is not known (fail-closed) */ }
+  return names
+}
+// FLEETTOFLAG1025 v4 (Codex 0dd77c650df7): no address marker in the line -- neither in the raw text nor in any DEQUOTED word of any
+// segment, the substitution-flattened form included. An unparseable line is not clean (fail-closed).
+function lineClean(cmd) {
+  if (FLEET_EXEMPT_BLOCK.test(cmd)) return false
+  let words
+  try {
+    words = [cmd, flattenSubstitutions(cmd)].flatMap((c) => segmentsTokens(c).flat())
+  } catch { return false }
+  return !words.some((w) => w.includes('@') || FLEET_TOKEN_BLOCK.test(tok(w)))
+}
+// true (not a letter) only if the whole line passed the address check and every --to / --t value -- the very next token, or the
+// part after `=` -- is a known agent name. A missing or empty value is not a name.
+function fleetToExempt(rest) {
+  if (!lineExemptOk) return false
+  const vals = []
+  for (let i = 0; i < rest.length; i++) {
+    const t = tok(rest[i])
+    if (t === '--to' || t === '--t') vals.push(i + 1 < rest.length ? tok(rest[i + 1]) : '')
+    else if (t.startsWith('--to=') || t.startsWith('--t=')) vals.push(t.slice(t.indexOf('=') + 1))
+  }
+  if (!vals.length) return false
+  const known = knownAgents()
+  return vals.every((v) => known.has(v))
+}
+// an undecidable program / script with a recipient flag is a send unless the fleet-agent exception holds
+const undecidableRecipientSends = (rest) => rest.some((t) => recipientFlag(t)) && !fleetToExempt(rest)
 function pythonScriptOperand(rest) {
   let stdinRedirect = false
   for (let i = 0; i < rest.length; i++) {
@@ -504,10 +725,10 @@ export function flattenSubstitutions(cmd) {
 }
 
 function pythonHeadSends(rest) {
-  const recipient = rest.some((t) => RECIPIENT_FLAG.test(t))
+  const recipient = rest.some((t) => recipientFlag(t))
   const { script, stdin, stdinRedirect } = pythonScriptOperand(rest)
   if (script !== null && SENDPY.test(basename(script))) return recipient
-  if (script !== null && UNDECIDABLE_PATH.test(script)) return recipient // MAILGATEVARARGS1020
+  if (script !== null && UNDECIDABLE_PATH.test(script)) return undecidableRecipientSends(rest) // MAILGATEVARARGS1020, FLEETTOFLAG1025 v4
   if (stdin || (script === null && stdinRedirect)) return recipient
   return false
 }
@@ -522,6 +743,9 @@ function headIsSend(toks, depth) {
   const prog = basename(toks[0])
   const rest = toks.slice(1)
   if (SENDER_PROG.test(prog)) return true
+  if (MAIL_PROG.test(prog) && mailProgSends(rest)) return true
+  // MAILGATEAPIB1027: curl speaks SMTP too (an smtp:// or smtps:// URL, --mail-rcpt, --mail-from)
+  if (CURLISH.test(prog) && rest.some((t) => CURL_SMTP.test(t))) return true
   if (WRAPPER_SHELL.test(prog) && depth < 3) {
     for (let i = 0; i < rest.length; i++) {
       if (rest[i] === '-c' && rest[i + 1] && isSendInvocation(rest[i + 1], depth + 1)) return true
@@ -530,7 +754,7 @@ function headIsSend(toks, depth) {
   if (PYTHON.test(prog) || NODEISH.test(prog)) {
     for (let i = 0; i < rest.length; i++) {
       if ((rest[i] === '-c' || rest[i] === '-e' || rest[i] === '--eval') &&
-          rest[i + 1] && codeStringSends(rest[i + 1])) return true
+          rest[i + 1] && codeStringSends(rest[i + 1], langOf(prog))) return true
     }
   }
   const candidates = [prog]
@@ -541,11 +765,14 @@ function headIsSend(toks, depth) {
       if (rest[i] === '-m' && rest[i + 1].split('.').pop() === 'send') candidates.push('send.py')
     }
   }
-  if (candidates.some((c) => SENDPY.test(c)) && rest.some((t) => RECIPIENT_FLAG.test(t))) return true
+  if (candidates.some((c) => SENDPY.test(c)) && rest.some((t) => recipientFlag(t))) return true
   if (PYTHON.test(prog) && pythonHeadSends(rest)) return true
   // An interpreter or program that cannot be resolved statically ($PY, a glob,
   // a substitution) with a recipient flag: what runs is undecidable here.
-  if (UNDECIDABLE_PATH.test(toks[0]) && rest.some((t) => RECIPIENT_FLAG.test(t))) return true
+  // FLEETTOFLAG1025: the address rule -- but a send.py run by it (`$PY scripts/support-mail/send.py --to x`) keeps the bare flag rule
+  const scriptTok = pythonScriptOperand(rest).script // the script position (interpreter options, redirections skipped), not a data argument
+  if (UNDECIDABLE_PATH.test(toks[0]) && (undecidableRecipientSends(rest)
+      || (scriptTok != null && SENDPY.test(basename(scriptTok)) && rest.some((t) => recipientFlag(t))))) return true
   if (toks.some((t) => GRAPHMAIL.test(basename(t))) && rest.includes('send')) return true
   // RESENDGETTWIN1010: only an actual send (POST/PUT/..., or a body) fires; a
   // read-only GET/HEAD passes; an undecidable method stays fail-closed.
@@ -598,8 +825,10 @@ export function buildWrapperDepthMsg() {
 // PIPED (#1855): `cat <<'EOF' | bash` or `| python3 -` hands the body over the pipe on the
 // heredoc's opening line; it is judged the same way.
 const HEREDOC_SENDER_ARGV = /['"](?:[^'"\s]*\/)?(?:sendmail|msmtp|swaks|send\.py)(?=['"\s])/
-const heredocBodySends = (body) =>
-  CODE_SEND.test(body) || CODE_SEND_MODULE.test(body) || (CODE_EXECISH.test(body) && HEREDOC_SENDER_ARGV.test(body))
+const heredocBodySends = (body, lang = null) => {
+  const masked = maskProseLiterals(body, lang)
+  return CODE_SEND.test(masked) || CODE_SEND_MODULE.test(masked) || (CODE_EXECISH.test(masked) && HEREDOC_SENDER_ARGV.test(body))
+}
 const HEREDOC_SHELL = /(?:^|[\s;&|(])(?:\S*\/)?(?:bash|sh|zsh|dash)\b[^\n<]*$/i
 const HEREDOC_INTERP = /(?:^|[\s;&|(])(?:\S*\/)?(python3?(?:\.\d+)?|node|tsx|ts-node|deno|bun)\b[^\n<]*$/i
 const HEREDOC_PIPE = /\|\s*(?:\S*\/)?(python3?(?:\.\d+)?|node|tsx|ts-node|deno|bun|bash|sh|zsh|dash)\b/i
@@ -616,7 +845,7 @@ function writtenThenRun(cmd, written, depth) {
       if (prog.toLowerCase() === 'npx' && args.length) args = args.slice(1) // npx <runner> <file>
       if (!args.length || !written.has(args[0])) continue
       const body = written.get(args[0])
-      if ((PYTHON.test(prog) || NODEISH.test(prog)) && heredocBodySends(body)) return true
+      if ((PYTHON.test(prog) || NODEISH.test(prog)) && heredocBodySends(body, langOf(prog))) return true
       if (WRAPPER_SHELL.test(prog) && depth < 3 && isSendInvocation(body, depth + 1)) return true
     }
   }
@@ -633,14 +862,15 @@ function heredocProgramSends(cmd, depth = 0) {
       const pbody = cmd.slice(m.index + m[1].length + 1, m.index + m[0].length - m[2].length)
       if (WRAPPER_SHELL.test(piped[1])) {
         if (depth < 3 && isSendInvocation(pbody, depth + 1)) return true
-      } else if (heredocBodySends(pbody)) return true
+      } else if (heredocBodySends(pbody, langOf(piped[1]))) return true
     }
     const lineStart = cmd.lastIndexOf('\n', m.index - 1) + 1
     const head = cmd.slice(lineStart, m.index)
     const bodyStart = m.index + m[1].length + 1
     const body = cmd.slice(bodyStart, m.index + m[0].length - m[2].length)
-    if (HEREDOC_INTERP.test(head)) {
-      if (heredocBodySends(body)) return true
+    const interp = HEREDOC_INTERP.exec(head)
+    if (interp) {
+      if (heredocBodySends(body, langOf(interp[1]))) return true
     } else if (HEREDOC_SHELL.test(head) && depth < 3) {
       if (isSendInvocation(body, depth + 1)) return true
     }
@@ -649,6 +879,9 @@ function heredocProgramSends(cmd, depth = 0) {
 }
 
 export function isSendInvocation(cmd, depth = 0) {
+  // FLEETTOFLAG1025 v4: the fleet-agent exception is decided on the WHOLE line; a wrapper body (depth > 0) can only tighten it.
+  // A module-level flag is enough: the hook is one process per tool call, and the evaluation is single-threaded.
+  lineExemptOk = (depth === 0 || lineExemptOk) && lineClean(cmd)
   if (heredocProgramSends(cmd, depth)) return true
   let segments
   try {
@@ -710,8 +943,11 @@ const NODE_MAIL_IMPORT = new RegExp(
   String.raw`\brequire\s*\(\s*${NODE_MAIL_MODULE}\s*\)|^[ \t]*import\b[^\n]*${NODE_MAIL_MODULE}|\bimport\s*\(\s*${NODE_MAIL_MODULE}\s*\)`,
   'm',
 )
-const PY_LOCAL_IMPORT = /^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import\b|import[ \t]+([\w., \t]+))/gm
-const NODE_LOCAL_IMPORT = /(?:\brequire\s*\(\s*|^[ \t]*import\b[^\n]*?\bfrom\s*|^[ \t]*import\s*|\bimport\s*\(\s*)['"](\.{1,2}\/[^'"\n]+)['"]/gm
+// MAILGATESCRIPT1027 R2: groups: 1 = X and 2 = NAMES of `from X import NAMES`, 3 = NAMES of `import NAMES`
+const PY_LOCAL_IMPORT = /^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import\b(?:[ \t]*\(?[ \t]*([\w., \t]+))?|import[ \t]+([\w., \t]+))/gm
+// MAILGATESCRIPT1027 R1: `export ... from './x'` (an ESM re-export) loads the helper too
+// MAILGATESCRIPT1027 R2: a type-only import or export loads nothing
+const NODE_LOCAL_IMPORT = /(?:^[ \t]*export(?![ \t]+type[ \t]*(?:\{|\*|[A-Za-z_$][\w$]*[ \t]+from\b))\b[^\n]*?\bfrom\s*|\brequire\s*\(\s*|^[ \t]*import(?![ \t]+type[ \t]*(?:\{|\*|[A-Za-z_$][\w$]*[ \t]+from\b))\b[^\n]*?\bfrom\s*|^[ \t]*import\s*|\bimport\s*\(\s*)['"](\.{1,2}\/[^'"\n]+)['"]/gm
 const NODE_EXTS = ['', '.js', '.mjs', '.cjs', '.ts', '/index.js', '/index.mjs', '/index.ts']
 const HELPER_LIMIT = 40
 const ADDRESS_FLAG = /^--(?:to|cc|bcc)(?:=(.*))?$/
@@ -747,13 +983,19 @@ function resolveScriptPath(script, cwd) {
 
 // node/tsx/bun/deno: the first non-option word is the script; -e/--eval code
 // strings are isSendInvocation's to judge.
-function nodeScriptOperand(rest) {
+// MAILGATESCRIPT1027: `bun run x` / `deno run x` skip the run word; `npx tsx x` / `npx ts-node x`
+// / `npx node x` name the script after the runner, any other npx package is no script.
+function nodeScriptOperand(prog, rest) {
+  const words = []
   for (const t of rest) {
     if (t === '--') continue
     if (t.startsWith('-')) return null
-    return t
+    words.push(t)
+    if (words.length === 2) break
   }
-  return null
+  if (prog === 'npx') return /^(?:tsx|ts-node|node)$/.test(words[0] ?? '') ? (words[1] ?? null) : null
+  if ((prog === 'bun' || prog === 'deno') && words[0] === 'run') return words[1] ?? null
+  return words[0] ?? null
 }
 
 function addressFlagGiven(rest) {
@@ -779,32 +1021,127 @@ function shebangKind(text) {
 
 // One level of local helpers: modules the script imports, resolved next to it.
 function localHelperPaths(path, text, kind) {
-  const dir = dirname(path)
-  const out = []
-  if (kind === 'py') {
-    for (const m of text.matchAll(PY_LOCAL_IMPORT)) {
-      const names = m[1] ? [m[1]] : m[2].split(',').map((n) => n.trim().split(/\s+/)[0])
-      for (const name of names) {
-        if (!name || name.startsWith('.')) continue
-        const rel = name.split('.').join('/')
-        out.push(join(dir, `${rel}.py`), join(dir, rel, '__init__.py'))
+  // MAILGATESCRIPT1027 R1: next to the script and, for a symlinked entry, next to its real path
+  const dirs = [dirname(path)]
+  try {
+    const real = dirname(realpathSync(path))
+    if (!dirs.includes(real)) dirs.push(real)
+  } catch { /* lexical directory only */ }
+  // MAILGATESCRIPT1027 R2: the limit applies per directory, so a symlinked entry's real-path helpers are looked at
+  const lists = []
+  for (const dir of dirs) {
+    const out = []
+    if (kind === 'py') {
+      for (const m of text.matchAll(PY_LOCAL_IMPORT)) {
+        if (m[1] && m[1].startsWith('.')) {
+          const rest = m[1].replace(/^\.+/, '')
+          let base = dir
+          for (let i = 0; i < m[1].length - rest.length - 1; i++) base = dirname(base)
+          const rels = rest ? [rest.split('.').join('/')] : (m[2] ?? '').split(',').map((n) => n.trim().split(/\s+/)[0])
+          for (const rel of rels) {
+            if (rel) out.push(join(base, `${rel}.py`), join(base, rel, '__init__.py'))
+          }
+          continue
+        }
+        const names = m[1] ? [m[1]] : (m[3] || '').split(',').map((n) => n.trim().split(/\s+/)[0])
+        for (const name of names) {
+          if (!name || name.startsWith('.')) continue
+          const rel = name.split('.').join('/')
+          out.push(join(dir, `${rel}.py`), join(dir, rel, '__init__.py'))
+        }
+      }
+    } else {
+      for (const m of text.matchAll(NODE_LOCAL_IMPORT)) {
+        for (const ext of NODE_EXTS) out.push(resolve(dir, m[1] + ext))
       }
     }
-  } else {
-    for (const m of text.matchAll(NODE_LOCAL_IMPORT)) {
-      for (const ext of NODE_EXTS) out.push(resolve(dir, m[1] + ext))
-    }
+    lists.push([...new Set(out)].filter((p) => p !== path).slice(0, HELPER_LIMIT))
   }
-  return [...new Set(out)].filter((p) => p !== path).slice(0, HELPER_LIMIT)
+  return [...new Set(lists.flat())]
 }
 
+// MAILGATEAPIB1027: a script file's (or helper's) text: the mail imports, the web mail APIs, and a CALL that runs a
+// mail program (a process-starting call whose first argument, a string or a list's first item, starts with
+// sendmail, msmtp or swaks; read on the raw text). See _FILE_EXEC_SENDER in hooks/outgoing-copy-gate.py for why
+// not the looser code-string rule. Mirrors _text_sends there.
+// Samu 50995 N1: the call is found on the MASKED text (a call shape quoted inside a prose literal is blanked there),
+// its first argument is read from the RAW text at the same position. The masker keeps the length in code points,
+// not in UTF-16 units, so the position is carried over in code points.
+const FILE_EXEC_CALL = new RegExp(
+  String.raw`(?:\bsubprocess\.(?:run|call|check_call|check_output|Popen)|\bos\.(?:system|popen)|\bexec(?:File)?(?:Sync)?|\bspawn(?:Sync)?)\s*\(`, 'g')
+const FILE_EXEC_ARG = new RegExp(
+  String.raw`^\s*\[?\s*['"` + '`' + String.raw`](?:[^'"` + '`' + String.raw`\s]*\/)?(?:sendmail|msmtp|swaks)(?=['"` + '`' + String.raw`\s])`)
+function fileExecSends(raw, masked) {
+  const rawCp = Array.from(raw)
+  // not expected; the raw text is then judged alone, which errs toward a send
+  if (rawCp.length !== Array.from(masked).length) masked = raw
+  for (const m of masked.matchAll(FILE_EXEC_CALL)) {
+    const at = Array.from(masked.slice(0, m.index + m[0].length)).length
+    if (FILE_EXEC_ARG.test(rawCp.slice(at).join(''))) return true
+  }
+  return false
+}
+const textSends = (raw, masked, imports) =>
+  imports.test(masked) || webMailSends(masked) || fileExecSends(raw, masked)
 function fileSends(path, text, kind, readScript) {
   const imports = kind === 'py' ? PY_MAIL_IMPORT : NODE_MAIL_IMPORT
-  if (imports.test(text)) return true
+  const lang = kind === 'py' ? 'py' : 'js'
+  if (textSends(text, maskProseLiterals(text, lang), imports)) return true
+  // The helpers are found on the raw text: a helper named only in a docstring is read too, which errs toward a send.
   return localHelperPaths(path, text, kind).some((h) => {
     const t = readScript(h)
-    return t !== null && imports.test(t)
+    return t !== null && textSends(t, maskProseLiterals(t, lang), imports)
   })
+}
+
+// python runs a directory's __main__.py, and a zip app's __main__.py from inside the archive
+// (MAILGATEDIRZIP1027). The archive is not unpacked here, so a zip run by python is a send.
+const ZIP_MAGIC = 'PK\u0003\u0004'
+function scriptFileSends(path, kind, readScript) {
+  let p = path
+  let text = readScript(p)
+  if (text === null && kind === 'py') {
+    p = join(path, '__main__.py')
+    text = readScript(p)
+  }
+  // node runs DIR/package.json "main", else DIR/index.js; a main that cannot be read as named is a send
+  if (text === null && kind === 'node') {
+    const pkg = readScript(join(path, 'package.json'))
+    let main = null
+    if (pkg !== null) {
+      try { main = JSON.parse(pkg)?.main ?? null } catch { return true }
+    }
+    const declared = typeof main === 'string' && main !== ''
+    p = declared ? resolve(path, main) : join(path, 'index.js')
+    text = readScript(p)
+    if (text === null && declared) return true
+  }
+  if (text === null) return false
+  if (kind === 'py' && text.includes(ZIP_MAGIC)) return true
+  return fileSends(p, text, kind, readScript)
+}
+
+// MAILGATEDIRZIP1027: MOD of `-m MOD` / `-mMOD` among the interpreter options, else null (the Python twin's
+// _python_module). `python -m MOD` runs MOD.py or MOD/__main__.py under cwd; an installed module cannot be
+// read here, so with no readable candidate it is not a send.
+function pythonModule(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i]
+    if (t === '-m') return rest[i + 1] ?? null
+    if (/^-m[^-]/.test(t)) return t.slice(2)
+    // -m at the end of a cluster of flags without a value (`-um MOD`, `-Im MOD`, `-BmMOD`)
+    const cluster = /^-[bBdEhiIOPqRsSuvVx]+m(.*)$/.exec(t)
+    if (cluster) return cluster[1] || (rest[i + 1] ?? null)
+    if (PY_OPT_WITH_ARG.has(t)) { i++; continue }
+    if (t.startsWith('-') && t !== '--' && !t.startsWith('-c')) continue
+    return null
+  }
+  return null
+}
+function pythonModuleSends(module, cwd, readScript) {
+  if (!/^[\w.]+$/.test(module) || !cwd) return false
+  const rel = module.split('.').join('/')
+  return [rel + '.py', join(rel, '__main__.py')].some((c) => scriptFileSends(resolve(cwd, c), 'py', readScript))
 }
 
 function headRunsSenderScript(toks, cwd, readScript, depth) {
@@ -822,11 +1159,15 @@ function headRunsSenderScript(toks, cwd, readScript, depth) {
   let kind
   if (PYTHON.test(prog)) {
     if (addressFlagGiven(rest)) return true // also under -m / -c, where no file is named
+    const module = pythonModule(rest)
+    if (module) return pythonModuleSends(module, cwd, readScript)
     script = pythonScriptOperand(rest).script
     kind = 'py'
-  } else if (NODEISH.test(prog) && prog !== 'npx') {
+  } else if (NODEISH.test(prog)) {
+    script = nodeScriptOperand(prog, rest)
+    // MAILGATESCRIPT1027 R1: npx with another package than the tsx / ts-node / node runner form is no script run
+    if (prog === 'npx' && script === null) return false
     if (addressFlagGiven(rest)) return true
-    script = nodeScriptOperand(rest)
     kind = 'node'
   } else if (SCRIPT_FILE.test(toks[0]) || toks[0].includes('/')) {
     // a directly executed file: its #! line picks the interpreter, else its extension
@@ -836,16 +1177,14 @@ function headRunsSenderScript(toks, cwd, readScript, depth) {
       (/\.py$/i.test(toks[0]) ? 'py' : SCRIPT_FILE.test(toks[0]) ? 'node' : null)
     if (!kind) return false
     if (addressFlagGiven(rest)) return true
-    const text = readScript(path)
-    return text !== null && fileSends(path, text, kind, readScript)
+    return scriptFileSends(path, kind, readScript)
   } else {
     return false
   }
   if (script === null) return false
   const path = resolveScriptPath(script, cwd)
   if (!path) return false
-  const text = readScript(path)
-  return text !== null && fileSends(path, text, kind, readScript)
+  return scriptFileSends(path, kind, readScript)
 }
 
 export function scriptRunSends(cmd, cwd = process.cwd(), readScript = readScriptHead, depth = 0) {

@@ -171,6 +171,69 @@ export function hostInDomains(host, domains) {
   for (const d of domains) if (host === d || host.endsWith(`.${d}`)) return true
   return false
 }
+// EGRESSMEASURE1025: a MEASURE-ONLY host class (owner decision A, 2026-10-25), so the fleet can read
+// the response headers of its own product (app.marveen.io) without that host being a vendor host
+// that any method, body, header or cookie may reach. store/egress-measure-hosts.json =
+// { "hosts": ["app.marveen.io"] }, the same exact-host shape check as the vendor list (no wildcard,
+// no suffix, no subdomain). A listed host is NOT added to the vendor hosts: classify() keeps denying
+// it. The only thing that passes is ONE command of exactly this shape, checked before classify():
+//   curl -q [ -s | -S | -sS | -Ss | --silent | --show-error | -I | --head | -i | --include
+//           | -D - | --dump-header - | -o /dev/null | --output /dev/null
+//           | -m N | --max-time N | --connect-timeout N | -X GET|HEAD | --request GET|HEAD ]... <one https URL>
+// - `curl` itself, first word, nothing before it (no env assignment, no path, no prefix word);
+// - `-q` as the FIRST argument, so ~/.curlrc is not read (an rc file could add data, headers, a
+//   cookie jar or a config);
+// - no other option at all: no -d/--data*/-F/-T (a body), -H/-b/-u/-K/--config (a header, a cookie,
+//   credentials, a config), -L (a redirect to another host), -x/--resolve/--connect-to (another
+//   route), -w, -e, -A;
+// - exactly one URL: https, a listed host, no userinfo, no port, no backslash, no curl glob;
+// - none of the shell's own syntax in the whole text: no $ ` ( ) < > | ; & \ { } [ ] * ~ newline,
+//   so there is no second command, no substitution, no redirection and no expansion to read.
+// Anything else falls through to classify(), which denies a measure host like any other. Every
+// command that passes here is appended to MEASURE_LOG: when, from where, the host, the path and the
+// query's length (never its text).
+export const MEASURE_HOSTS_PATH = process.env.BASH_EGRESS_MEASURE_HOSTS || join(ROOT, 'store', 'egress-measure-hosts.json')
+export const MEASURE_LOG = process.env.BASH_EGRESS_MEASURE_LOG || join(ROOT, 'store', 'bash-egress-measure.jsonl')
+export function loadMeasureHosts(path = MEASURE_HOSTS_PATH) {
+  try { return parseVendorHosts(JSON.parse(readFileSync(path, 'utf-8'))) } catch { return new Set() }
+}
+const MEASURE_FORBIDDEN = /[$`()<>|;&\\{}[\]*~\n\r]/
+const MEASURE_FLAGS = new Set(['-s', '-S', '-sS', '-Ss', '--silent', '--show-error', '-I', '--head', '-i', '--include'])
+const MEASURE_VALUE_FLAGS = new Map([
+  ['-D', (v) => v === '-'], ['--dump-header', (v) => v === '-'],
+  ['-o', (v) => v === '/dev/null'], ['--output', (v) => v === '/dev/null'],
+  ['-m', (v) => /^\d{1,3}$/.test(v)], ['--max-time', (v) => /^\d{1,3}$/.test(v)],
+  ['--connect-timeout', (v) => /^\d{1,3}$/.test(v)],
+  ['-X', (v) => v === 'GET' || v === 'HEAD'], ['--request', (v) => v === 'GET' || v === 'HEAD'],
+])
+const MEASURE_URL = /^https:\/\/[a-z0-9.-]+(?:\/[A-Za-z0-9._~!'+,=:@%/-]*)?(?:\?[A-Za-z0-9._~!'+,=:@%/?-]*)?$/
+// The measure-only verdict: { host, path } when the command is exactly the allowed shape for a listed
+// host, null otherwise (null never allows anything: classify() then judges the command as before).
+export function measureOnly(command, measureHosts) {
+  if (typeof command !== 'string' || measureHosts.size === 0) return null
+  const text = command.trim()
+  if (text === '' || MEASURE_FORBIDDEN.test(text)) return null
+  const w = shellWords(text)
+  if (w[0] !== 'curl' || w[1] !== '-q') return null
+  let url = null
+  for (let i = 2; i < w.length; i++) {
+    const a = w[i]
+    if (MEASURE_FLAGS.has(a)) continue
+    const check = MEASURE_VALUE_FLAGS.get(a)
+    if (check) { if (i + 1 >= w.length || !check(w[i + 1])) return null; i++; continue }
+    if (a.startsWith('-')) return null
+    if (url !== null) return null
+    url = a
+  }
+  if (url === null || !MEASURE_URL.test(url)) return null
+  let u
+  try { u = new URL(url) } catch { return null }
+  if (u.protocol !== 'https:' || u.username || u.password || u.port || !measureHosts.has(u.hostname)) return null
+  // The query's LENGTH, never its text (Marveen 45624): enough to tell a token-carrying link from a
+  // bare one. Counted on the command's own spelling, not u.search: WHATWG re-encodes ' in a query.
+  const q = url.indexOf('?')
+  return { host: u.hostname, path: u.pathname, query: u.search !== '', queryLength: q === -1 ? 0 : url.length - q - 1 }
+}
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 // One-liner URL schemes: every network scheme libcurl speaks (minus file:, and ipfs:/ipns:, which
 // resolve through a gateway, not the literal host). A one-liner reaches all of them through a curl
@@ -1547,6 +1610,35 @@ function curlConfigFromPrintf(configs, { norm, masked, orig, a, b, lifted, feeds
   const k = all.findIndex(([s, e]) => s === a && e === b)
   return cfg !== null && k !== -1 && onlyTheRecipe(cfg, { norm, masked, lifted, all, k, src: -1, kSubst: subs[0] })
 }
+// `IFS=x read -r line` (also with other assignments before `read`): a prefix assignment lasts for that one
+// builtin and never re-splits the words of a later command, so it is not an IFS change for the
+// ifs-expanded-command rule (EGRESSIFSREAD1025). The text is the masked one, where quoted values are already
+// blanked. Only blanks and tabs may separate the words (a newline or a `;` ends the command),
+// so an IFS assignment on its own, or on anything else than `read`, still counts.
+const IFS_READ_PREFIX = /(?:[A-Za-z_]\w*\+?=[^\s"';&|()<>]*[ \t]+)*IFS\+?=[^\s"';&|()<>]*(?:[ \t]+[A-Za-z_]\w*\+?=[^\s"';&|()<>]*)*[ \t]+read(?=[\s;&|)]|$)/g
+// The assignment has to open a simple command (#2298 review): behind `export`, `declare`, `readonly`, `typeset`,
+// `local` or any other command word the same text is an ARGUMENT, and the assignment persists in the shell.
+// atCommandStart reads the ORIGINAL text before `idx` (the masked one turns `'export'` into blanks): the
+// previous token must be a command separator (`;` `&` `|` `(` or a newline, not escaped), or the start of the text, or one of the keywords below, or a lone `!` or `{`, and
+// each of these has to stand at a command start itself (so `export do IFS=_ read` and `export ! IFS=_ read` do not pass).
+const COMMAND_KEYWORDS = new Set(['while', 'until', 'if', 'then', 'do', 'elif', 'else'])
+function atCommandStart(text, idx) {
+  let i = idx
+  while (i > 0 && (text[i - 1] === ' ' || text[i - 1] === '\t')) i--
+  if (i === 0) return true
+  const c = text[i - 1]
+  if (c === '\n') return true
+  if (c === ';' || c === '&' || c === '|' || c === '(') return text[i - 2] !== '\\'
+  let j = i
+  while (j > 0 && !/[\s;&|()<>]/.test(text[j - 1])) j--
+  const word = text.slice(j, i)
+  return (word === '!' || word === '{' || COMMAND_KEYWORDS.has(word)) && atCommandStart(text, j)
+}
+// ...and `read` has to be the builtin. A `read` function, an alias for it, or POSIX mode (where an assignment
+// in front of a function persists) take the exemption away. The check reads the whole text with the quotes
+// taken out (so `eval 'set -o posix'` and `re''ad(){ :; }` count too), and it is deliberately loose: a false
+// hit only takes the exemption away. Text that only a later eval or source computes stays out of reach.
+const READ_NOT_BUILTIN = /\bPOSIXLY_CORRECT\b|\b(?:set|shopt)\b[^;&|\n]*\bposix\b|\balias\b[^;&|\n]*\bread=|\bfunction[ \t]+read\b|\bread[ \t]*\([ \t]*\)/
 // Function bodies are judged per call, and a body calling other functions fans out: identical
 // readings are judged once per top-level command, and past FUNCTION_BUDGET judgements the command
 // denies (measured: 30 functions calling each other took 12 s before the memo).
@@ -1598,7 +1690,8 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
     orig = blankRanges(orig, ranges); masked = blankRanges(masked, ranges)
   }
   const inDef = (at) => defs.some((d) => at >= d.start && at < d.end)
-  const ifsSet = /(?:^|[\s;&|(!{])IFS\+?=/.test(masked)
+  const readIsBuiltin = !READ_NOT_BUILTIN.test(norm.replace(/['"\\]/g, '')) && !defs.some((d) => d.name === 'read')
+  const ifsSet = /(?:^|[\s;&|(!{])IFS\+?=/.test(readIsBuiltin && masked.includes('IFS') ? masked.replace(IFS_READ_PREFIX, (m, at) => (atCommandStart(orig, at) ? ' ' : m)) : masked)
   const calls = new Map()                                         // function name -> spans calling it
   if (fetches) {
     const redirect = envRedirect(masked) ?? envIndirect(orig, masked)
@@ -1878,6 +1971,17 @@ if (isInvokedDirectly()) {
   if (payload?.tool_name !== 'Bash') process.exit(0)
   let r
   setHookCwd(payload?.cwd)
+  // EGRESSMEASURE1025: the measure-only shape for a measure host passes, logged; anything else is
+  // judged below exactly as before. A log failure denies: the owner's condition is that every
+  // measurement is on record.
+  const measured = measureOnly(payload?.tool_input?.command, loadMeasureHosts())
+  if (measured) {
+    try {
+      mkdirSync(dirname(MEASURE_LOG), { recursive: true })
+      appendFileSync(MEASURE_LOG, JSON.stringify({ ts: new Date().toISOString(), cwd: payload?.cwd ?? process.cwd(), session: payload?.session_id ?? null, host: measured.host, path: measured.path, query: measured.query, query_len: measured.queryLength }) + '\n')
+      process.exit(0)
+    } catch { /* not on record: fall through to classify(), which denies the measure host */ }
+  }
   try { r = classify(payload?.tool_input?.command, 0, loadVendorHosts(), loadVendorDomains()) } catch (e) {
     // Since curl https:// and wget left the deny list, this hook is the ONLY thing between them and an
     // external host, so an internal error on a command naming either verb denies instead of allowing.

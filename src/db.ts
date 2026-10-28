@@ -133,6 +133,14 @@ export function ensureKanbanClaimSchema(d: Database.Database): boolean {
 type CachedEmbedding = { len: number; vec: Float64Array | null; parsed: unknown; failed: boolean; normSq: number }
 const embeddingCache = new Map<number, CachedEmbedding>()
 const EMBEDDING_CACHE_MAX = 200_000
+// What the embedding_model column records: the model, plus the truncation
+// when EMBED_DIMS is set, so a change of either one marks old vectors as
+// another model's (excluded from search, re-embedded by the backfill).
+// Read at call time, not at import: many tests mock config.js without the
+// EMBED_* settings, and a module-level read fails their import.
+function embedIdentity(): string {
+  return EMBED_DIMS > 0 ? `${EMBED_MODEL}@${EMBED_DIMS}` : EMBED_MODEL
+}
 export function forgetCachedEmbedding(id: number | bigint): void { embeddingCache.delete(Number(id)) }
 /** Exposed for tests only. */
 export function getEmbeddingCacheSize(): number { return embeddingCache.size }
@@ -572,6 +580,22 @@ export function initDatabase(dbPathOverride?: string): void {
     db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT')
   } catch {
     // column already exists
+  }
+
+  // Migration: which embedding model wrote the vector. When the column is
+  // added, every vector already stored is stamped with the model configured
+  // now. Assumption: those vectors were written by this model. A model switch
+  // made earlier without re-embedding is misattributed here, as it was before
+  // the column existed; the next switch re-embeds those rows like any other.
+  let addedEmbeddingModel = false
+  try {
+    db.exec('ALTER TABLE memories ADD COLUMN embedding_model TEXT')
+    addedEmbeddingModel = true
+  } catch {
+    // column already exists
+  }
+  if (addedEmbeddingModel) {
+    db.prepare('UPDATE memories SET embedding_model = ? WHERE embedding IS NOT NULL').run(embedIdentity())
   }
 
   // MEMIRASNYOM915: write-trace columns. Every agent patches memories with
@@ -1135,6 +1159,10 @@ export function initDatabase(dbPathOverride?: string): void {
   // sets it; POST /api/messages never does, so a 1 here is authenticated by construction.
   // 0 for every older row.
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN stop_authorized INTEGER NOT NULL DEFAULT 0') } catch { /* exists */ }
+  // Federated inbound rows: the sending peer's message id (the inbox `ref`), stored so the
+  // completion receipt sent back over the bridge names the message the PEER knows -- our local
+  // id means nothing on the other system. Null for local rows and for federated rows from before.
+  try { db.exec('ALTER TABLE agent_messages ADD COLUMN remote_ref TEXT') } catch { /* exists */ }
 
   // INVARIANT: a row that says 'delivered' must carry a delivered_at.
   //
@@ -1988,7 +2016,7 @@ export function saveMemory(
   // backfilled it by hand.
   generateEmbedding(content).then(emb => {
     if (emb) {
-      db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(emb), id)
+      db.prepare('UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ? AND content = ? AND keywords IS ?').run(JSON.stringify(emb), embedIdentity(), id, content, null)
       forgetCachedEmbedding(id)
     }
   }).catch(() => {})
@@ -2344,7 +2372,7 @@ function insertMemoryRow(
 function scheduleEmbedding(id: number, content: string, keywords: string | undefined): void {
   generateEmbedding(content + (keywords ? ' ' + keywords : '')).then(emb => {
     if (emb) {
-      db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(emb), id)
+      db.prepare('UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ? AND content = ? AND keywords IS ?').run(JSON.stringify(emb), embedIdentity(), id, content, keywords ?? null)
       forgetCachedEmbedding(id)
     }
   }).catch(() => {})
@@ -2543,7 +2571,10 @@ export function updateMemory(id: number, content: string, category?: string, age
   // resends the unchanged body on a category-only edit), so presence alone says
   // nothing about a change.
   const keywordsChanged = keywords !== undefined && (before?.keywords ?? null) !== keywords
-  if (before && (before.content !== content || keywordsChanged)) sets.push('embedding = NULL')
+  if (before && (before.content !== content || keywordsChanged)) {
+    sets.push('embedding = NULL')
+    sets.push('embedding_model = NULL')
+  }
   if (category) { sets.push('category = ?'); params.push(category) }
   if (agentId) { sets.push('agent_id = ?'); params.push(agentId) }
   if (keywords !== undefined) { sets.push('keywords = ?'); params.push(keywords) }
@@ -3086,7 +3117,7 @@ export function sweepArchivedKanbanCards(): number {
 // measuring the watcher, not the work. Falls back to created_at for cards
 // that have never moved (no event rows), which is the honest age for those.
 export function listKanbanCards(
-  opts: { includeArchived?: boolean; agent?: string } = {},
+  opts: { includeArchived?: boolean; agent?: string; statuses?: readonly string[]; ids?: readonly string[] } = {},
 ): KanbanCard[] {
   // A szures SZERVER-oldalon tortenik, mert a hivo nem tudja ellenorizni, hogy megtortent-e.
   // A defektus, amit ez javit: az `agent=` parametert a vegpont NEMAN eldobta, tehat egy
@@ -3098,6 +3129,16 @@ export function listKanbanCards(
   // COLLATE NOCASE: configured names are capitalised (BOT_NAME=Marveen) while stored
   // assignees are typically lowercase (`marveen`); an exact match found neither spelling.
   if (opts.agent) { feltetelek.push('c.assignee = ? COLLATE NOCASE'); ertekek.push(opts.agent) }
+  // Card 12b0f698: the status and id filters run in SQL, so a narrow read never builds the
+  // whole board. An empty list is a caller's "match nothing", never "no filter".
+  if (opts.statuses) {
+    feltetelek.push(opts.statuses.length ? `c.status IN (${opts.statuses.map(() => '?').join(', ')})` : '0')
+    ertekek.push(...opts.statuses)
+  }
+  if (opts.ids) {
+    feltetelek.push(opts.ids.length ? `c.id IN (${opts.ids.map(() => '?').join(', ')})` : '0')
+    ertekek.push(...opts.ids)
+  }
   const where = feltetelek.length ? `WHERE ${feltetelek.join(' AND ')} ` : ''
   const cards = db
     .prepare(`SELECT c.rowid AS seq, c.*,
@@ -4632,6 +4673,9 @@ export interface AgentMessage {
   // Card 71263d15 (C): 1 = a STOP from an authenticated writer (see the migration). Optional in the type
   // only because rows built in code before the column (tests, fixtures) do not carry it.
   stop_authorized?: number
+  // The SENDER's own id for a federated inbound row (the bridge's `ref`), so a completion
+  // receipt can name the message the peer knows. Null for local rows and older federated ones.
+  remote_ref?: string | null
 }
 
 export function createAgentMessage(
@@ -4640,7 +4684,7 @@ export function createAgentMessage(
   content: string,
   originNote?: string | null,
   traceCtx?: { trace_id: string; span_id: string; parent_span_id: string | null } | null,
-  opts?: { urgent?: boolean; stopAuthorized?: boolean; priority?: 0 | 1 },
+  opts?: { urgent?: boolean; stopAuthorized?: boolean; priority?: 0 | 1; remoteRef?: string | null },
 ): AgentMessage {
   const now = Math.floor(Date.now() / 1000)
   // Card 795d1f48 (a): urgent only when a caller asks for it; the callers that may are the in-process writers and the
@@ -4652,9 +4696,10 @@ export function createAgentMessage(
   // Card ad771121: the stored delivery priority (0 normal, 1 high), as the caller decided it (the route's
   // per-pair budget, decidePriority). An urgent row is above high by its own column; the route stores it 0.
   const priority: 0 | 1 = opts?.priority === 1 ? 1 : 0
+  const remoteRef = opts?.remoteRef ?? null
   const info = db.prepare(
-    'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, origin_note, trace_id, span_id, parent_span_id, urgent, stop_authorized, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(from, to, content, 'pending', now, originNote ?? null, traceCtx?.trace_id ?? null, traceCtx?.span_id ?? null, traceCtx?.parent_span_id ?? null, urgent, stopAuthorized, priority)
+    'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, origin_note, trace_id, span_id, parent_span_id, urgent, stop_authorized, priority, remote_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(from, to, content, 'pending', now, originNote ?? null, traceCtx?.trace_id ?? null, traceCtx?.span_id ?? null, traceCtx?.parent_span_id ?? null, urgent, stopAuthorized, priority, remoteRef)
   return {
     id: Number(info.lastInsertRowid),
     from_agent: from, to_agent: to, content, status: 'pending',
@@ -4666,6 +4711,7 @@ export function createAgentMessage(
     urgent,
     stop_authorized: stopAuthorized,
     priority,
+    remote_ref: remoteRef,
   }
 }
 
@@ -5846,10 +5892,14 @@ function vectorSearch(
   // vector's byte length: the vectors come from embeddingCache. The date
   // window (card f90928e3) narrows the candidates here, so the similarity
   // floor below is computed over the windowed rows.
+  // A vector from another model with the same dimension cannot be told apart by
+  // length, so the model name is the filter. The migration stamps the vectors
+  // it finds; a NULL row was written later by a build from before the column
+  // and keeps the length check.
   const dt = tsClause('created_at', range)
   const cands = db.prepare(
-    `SELECT id, octet_length(embedding) AS elen FROM memories WHERE embedding IS NOT NULL AND (agent_id = ? OR category = 'shared')${category ? ' AND category = ?' : ''}${dt.sql}`
-  ).all(agentId, ...(category ? [category] : []), ...dt.params) as { id: number; elen: number }[]
+    `SELECT id, octet_length(embedding) AS elen FROM memories WHERE embedding IS NOT NULL AND (embedding_model IS NULL OR embedding_model = ?) AND (agent_id = ? OR category = 'shared')${category ? ' AND category = ?' : ''}${dt.sql}`
+  ).all(embedIdentity(), agentId, ...(category ? [category] : []), ...dt.params) as { id: number; elen: number }[]
 
   // Parse only what is new or changed since the last call.
   let getVec: Database.Statement | null = null
@@ -6047,15 +6097,17 @@ export interface BackfillResult {
 }
 
 export async function backfillEmbeddings(): Promise<BackfillResult> {
-  const rows = db.prepare('SELECT id, content, keywords FROM memories WHERE embedding IS NULL').all() as { id: number; content: string; keywords: string | null }[]
+  const rows = db.prepare('SELECT id, content, keywords FROM memories WHERE embedding IS NULL OR (embedding_model IS NOT NULL AND embedding_model != ?)').all(embedIdentity()) as { id: number; content: string; keywords: string | null }[]
   let count = 0
   for (const row of rows) {
     const text = row.content + (row.keywords ? ' ' + row.keywords : '')
     const emb = await generateEmbedding(text)
     if (emb) {
-      db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(emb), row.id)
+      // The write only lands if the row still holds the text that was embedded; an
+      // edit in between leaves the vector NULL for the next backfill round.
+      const stored = db.prepare('UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ? AND content = ? AND keywords IS ?').run(JSON.stringify(emb), embedIdentity(), row.id, row.content, row.keywords).changes > 0
       forgetCachedEmbedding(row.id)
-      count++
+      if (stored) count++
     }
     // Small delay to not overwhelm Ollama
     await new Promise(r => setTimeout(r, 100))

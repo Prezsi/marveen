@@ -108,7 +108,15 @@ const FOOTER_TRUNCATED_RX = /(?:[A-Za-z][\w-]* ){1,3}on · [^\n]*·[^\n]*…\s*$
 // glyph (⏵⏵, ⏵, ⏸): detectPaneState returns 'idle' on this footer even without an
 // input box above it, so a log line or a sentence in the footer slot that ends in
 // the same words must not match.
-const FOOTER_SHELL_TAIL_RX = /^\s*[\u23F5\u23F8]{1,2} (?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\))? · \d+ shells?(?:(?: ·|,) \d+ monitors?)?\s*$/
+// MONITORTAIL1025 (measured 2026-10-25 on two builder panes): the count can be a MONITOR alone or first --
+// `⏵⏵ bypass permissions on · 1 monitor`, shell-less and hint-less, with an empty prompt above, while a Monitor
+// waits on a long run. That read 'unknown': the router held the bus for hours and the not-ready path raised a
+// [session-stuck] every 10 minutes on a live session. The tail is now one or more `N shell(s)` / `N monitor(s)`
+// counters in any order, joined as before (` · ` or a comma and one space); any other kind still stays 'unknown'.
+const FOOTER_COUNT = String.raw`\d+ (?:shells?|monitors?)`
+const FOOTER_SHELL_TAIL_RX = new RegExp(
+  String.raw`^\s*[\u23F5\u23F8]{1,2} (?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\))? · ${FOOTER_COUNT}(?:(?: ·|,) ${FOOTER_COUNT})*\s*$`,
+)
 
 /**
  * Index of the idle footer line, or -1. The full footer may sit anywhere the
@@ -128,6 +136,39 @@ function idleFooterIndex(lines: string[]): number {
 
 function hasIdleFooter(lines: string[]): boolean {
   return idleFooterIndex(lines) >= 0
+}
+
+/**
+ * IDLEFLUSHVETO812: background work an idle-LOOKING pane is still waiting on.
+ * The footer counts BashTool background shells (`N shell(s)`) and running
+ * Monitors (`N monitor(s)`); a background-agent block with a live clock is
+ * sub-agents at work. All three classify the pane as idle (they must, or the
+ * router would never deliver to it), and the transcript stays quiet while they
+ * run, so the idle-flush tier cannot tell such a session from a finished one.
+ * A flush restarts the session and kills that work. The counts are read ONLY
+ * on the live idle footer line (idleFooterIndex), never from scrollback.
+ * null = no recognised idle footer (nothing to say either way).
+ */
+export function detectBackgroundWork(pane: string | null): { shells: number; monitors: number; agents: number } | null {
+  if (!pane) return null
+  const bg = splitBackgroundAgentBlock(pane.split('\n'))
+  const lines = bg ? bg.above : pane.split('\n')
+  const agents = detectBackgroundAgents(pane)?.running ?? 0
+  const idx = idleFooterIndex(lines)
+  if (idx < 0) return null
+  const footer = stripAllAnsi(lines[idx])
+  const count = (rx: RegExp) => Number(rx.exec(footer)?.[1] ?? 0)
+  return {
+    shells: count(/(?:·|,) (\d+) shells?\b/),
+    monitors: count(/(?:·|,) (\d+) monitors?\b/),
+    agents,
+  }
+}
+
+/** True when the idle-looking pane still runs a background shell, a Monitor or a sub-agent. */
+export function hasBackgroundWork(pane: string | null): boolean {
+  const w = detectBackgroundWork(pane)
+  return w !== null && (w.shells > 0 || w.monitors > 0 || w.agents > 0)
 }
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
@@ -208,6 +249,21 @@ const BUSY_INDICATORS: RegExp[] = [
   // above is the authoritative fallback.
   new RegExp(
     String.raw`\b(?:Combobulating|Beaming|Thinking|Pondering|Reticulating|Configuring|Noodling|Ruminating|Percolating|Cogitating|Deliberating|Contemplating|Musing|Brewing|Synthesizing|Distilling|Refining|Simmering|Crafting|Formulating|Consulting|Unfurling|Unspooling|Unraveling)…\s*\(\s*${TURN_ELAPSED}\s*·\s*↓`,
+  ),
+  // Hook phase (HOOKPHASEBUSY1027). While Claude Code runs the hooks of a
+  // PreToolUse / PostToolUse / Stop / UserPromptSubmit event, the spinner line
+  // opens its parenthesis with `running <Event> hooks…` and a hook counter, so
+  // the elapsed time is no longer the first thing inside it and neither pattern
+  // above matches. Measured on live panes: "· Osmosing… (running PreToolUse
+  // hooks… 0/6 · 4m 49s · ↓ 23.5k tokens)", and "(running UserPromptSubmit
+  // hooks… 8/10 · 0s)" with no token counter at all. Such a pane read idle and
+  // ready for a prompt in the middle of a live turn. The match is anchored to
+  // the start of a line (`<glyph> <label>… (`) so prose or a quoted frame in
+  // the reply text, which never starts a line that way, stays idle; the
+  // trailing `· ` / `)` keeps the elapsed time a whole token.
+  new RegExp(
+    String.raw`^\s*\S \S+… \(running [A-Za-z]+ hooks(?:…|\.\.\.)\s*\d+/\d+\s*·\s*${TURN_ELAPSED}(?=\s*[·)])`,
+    'm',
   ),
 ]
 

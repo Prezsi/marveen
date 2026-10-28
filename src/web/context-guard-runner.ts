@@ -19,7 +19,7 @@ import { sendSystemDirective } from './system-directive.js'
 import { deliverWhenReady, RESUME_DELIVERY_OPTIONS } from './resume-delivery.js'
 import { notifyChannel } from '../notify.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
-import { detectPaneState, paneShowsContextSaturation, paneShowsContextSaturationHardError } from '../pane-state.js'
+import { detectPaneState, hasBackgroundWork, paneShowsContextSaturation, paneShowsContextSaturationHardError } from '../pane-state.js'
 import { readContextTokensFromProjectDir, readActiveModelFromProjectDir, readTranscriptMtimeFromProjectDir, readTranscriptTailFromProjectDir } from './active-model.js'
 import { readContextGuardConfig } from './context-guard-store.js'
 import { setDeliveryHoldProbe, type DeliveryHold } from './delivery-hold.js'
@@ -822,6 +822,9 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
     pct: cfg.enabled ? measuredPct : null,
     paneIdle: paneState === 'idle',
     paneBusy: paneState === 'busy',
+    // IDLEFLUSHVETO812: only a pane we actually captured can say "no background
+    // work"; not captured = unknown, and unknown must not let a flush through.
+    paneBackgroundWork: pane === null ? true : hasBackgroundWork(pane),
     sessionReady,
     handoffMtime: needPct ? handoffMtime(name) : null,
     // Already reconciled with the measurement above, so decideGuard itself
@@ -1275,6 +1278,6 @@ export function startContextGuardRunner(): NodeJS.Timeout {
       tickRunning = false
     }
   }
-  setTimeout(sweep, INITIAL_DELAY_MS)
+  setTimeout(whileNotFrozen('context-guard', sweep), INITIAL_DELAY_MS)
   return setInterval(whileNotFrozen('context-guard', sweep), INTERVAL_MS)
 }

@@ -56,6 +56,62 @@ szekció) érdemes lenne `references/` alá mozgatni.
 
 ---
 
+## Agents on the worksource channel
+
+An agent can opt into the worksource channel (`worksourceChannel: true` in its
+`agent-config.json`). For such an agent the scheduler delivers the prompt
+differently:
+
+- **Queued, not typed.** The prompt goes into the agent's worksource queue
+  directory as an item, and the channel reader hands it to the agent as a real
+  turn. Nothing is typed into its tmux pane.
+- **Same prompt text.** The queued content is byte for byte the prompt the
+  typed path would send, including the preamble, the delivery instruction and
+  the task block.
+- **Item meta.** The item carries `from: scheduler`, `message_id` (the item id),
+  `task` and `category: scheduled-task`.
+
+**Item id rule.** The id is `sched-<slug>-<hash8>-<stamp>`, so the same
+occurrence never lands twice. The slug is the task name with every character
+outside `A-Za-z0-9._-` replaced by `-`, cut to 60 characters; `<hash8>` is the
+first 8 hex digits of the full name's SHA-256, so two names with the same slug
+still get different ids. For a cron occurrence the stamp is the UTC minute
+of the scheduled occurrence, date included (one item per scheduled minute). A
+pending-retry fire stamps the retry row's `first_attempt` -- the time of the
+first busy hit, not the scheduled minute, and one row per task and agent -- so
+every retry of that row maps to the same item; it dedupes in practice because
+the row exists only when the cron path did not queue the item, and it is a
+dedupe key, not an occurrence key. A manual "Run now" gets its own id with its
+own timestamp.
+
+**The sender-role gate keeps the typed path.** An agent configured with
+`senderRoleGate` still gets its scheduled prompts typed into its pane, even
+with `worksourceChannel: true`. A queued item reaches the agent inside a
+`<channel source="worksource" ...>` envelope, which the gate's hook treats as
+a non-owner sender and answers by denying the configured risky tools; a typed
+prompt carries no envelope and is treated as the owner. The item's
+`from: scheduler` meta is not an owner credential -- anything that can write
+the queue directory can set it -- so it is deliberately not used to lift the
+gate.
+
+**What does not apply.** The typing-specific machinery is skipped: the idle
+wait before typing, the post-send resubmit chain, the delivery-integrity check
+and the lost re-injection. The queue's reader owns the delivery from here: the
+agent acknowledges each item with `work_complete`, and the reader re-offers any
+item left unacknowledged past its timeout or across a restart.
+
+**What still applies.** Every gate before the send runs unchanged (restart in
+flight, missing session and auto-start, readiness and busy checks, forceSend
+rules, usage limit, MCP pre-check). The busy-timeout alert also still applies:
+if the agent stays busy long past the threshold, the watchdog alerts as usual.
+
+**No extra rights.** The reader treats a `from: scheduler` item exactly like
+any other routed item: same verbatim delivery, same provenance stamp, same
+acknowledgment contract. Being sent by the scheduler grants the content
+nothing.
+
+---
+
 ## Fájlstruktúra
 
 Minden feladat egy önálló mappában él:
