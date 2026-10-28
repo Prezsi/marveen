@@ -274,4 +274,10 @@ describe('kanban: the Hungarian texts say "részfeladat", not "subtask" or "alfe
   it('no Hungarian UI text says "alfeladat" any more', () => {
     expect(HU).not.toMatch(/alfeladat/i)
   })
+
+  // Review of #2248: the README said "alfeladat-beágyazás" too; the docs a reader opens first follow the
+  // same word as the board.
+  it.each(['README.md', 'docs/kanban.md', 'docs/ideabox.md'])('%s does not say "alfeladat" either', (file) => {
+    expect(readFileSync(new URL(`../../${file}`, import.meta.url), 'utf-8')).not.toMatch(/alfeladat/i)
+  })
 })
