@@ -135,6 +135,35 @@ describe('confirmDialog', () => {
   })
 })
 
+// Review of #2246: the pins below prove that each button asks, not that the answer counts. With the
+// `if (!confirmed) return` removed, "Mégse" would still send the request and every test stayed green.
+// So for each call site: the answer of THIS confirmDialog is checked, and returns, before the first
+// request the handler sends. (The main-agent restart button proves the same by running its handler:
+// marveen-restart-button-force.test.ts, "the first confirm declined: no request at all".)
+describe('a "no" stops the action: the answer is checked before the request', () => {
+  const site = (anchor: string, request: string) => {
+    const i = APP.indexOf(anchor)
+    const j = i < 0 ? -1 : APP.indexOf(request, i)
+    return i < 0 || j < 0 ? '' : APP.slice(i, j + request.length)
+  }
+
+  it.each([
+    ['agent stop', "document.getElementById('agentStopBtn').addEventListener('click'", "/stop`, { method: 'POST' })"],
+    ['agent delete', "document.getElementById('deleteAgentBtn').onclick = async () => {", "{ method: 'DELETE' })"],
+    ['channel: remove a connected chat', 'async function removeAllowed(kind, id) {', "{ method: 'DELETE' })"],
+    ['channel: revoke an invite link', 'async function revokeInviteToken(token) {', "{ method: 'DELETE' })"],
+    ['channel: disconnect', "document.getElementById('chDisconnectBtn').addEventListener('click'", "{ method: 'DELETE' })"],
+  ])('%s', (_name, anchor, request) => {
+    const body = site(anchor, request)
+    expect(body, 'handler or its request not found').not.toBe('')
+    const ask = body.indexOf('const confirmed = await confirmDialog({')
+    const guard = body.indexOf('if (!confirmed) return')
+    expect(ask).toBeGreaterThan(-1)
+    expect(guard).toBeGreaterThan(ask)
+    expect(body.slice(0, guard)).not.toMatch(/\bfetch\(/)
+  })
+})
+
 describe('the agent actions use it', () => {
   const handler = (anchor: string, endMarker: string) => {
     const i = APP.indexOf(anchor)
