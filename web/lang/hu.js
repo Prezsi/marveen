@@ -1754,6 +1754,8 @@ window._i18n.hu = {
   // --- Skills toasts ---
   'skills.toast.added':          'Skill hozzáadva',
   'skills.toast.select_file':    'Válassz egy .skill fájlt',
+  'skills.toast.name_required': 'Add meg a skill nevét.',
+  'skills.toast.desc_required': 'Írd le, mit csináljon a skill.',
 
   // --- Tasks toasts ---
   'tasks.toast.select_schedule': 'Válassz ütemezést',

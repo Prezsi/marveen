@@ -1751,6 +1751,8 @@ window._i18n.en = {
   // --- Skills toasts ---
   'skills.toast.added':          'Skill added',
   'skills.toast.select_file':    'Select a .skill file',
+  'skills.toast.name_required': 'Enter the skill name.',
+  'skills.toast.desc_required': 'Describe what the skill should do.',
 
   // --- Tasks toasts ---
   'tasks.toast.select_schedule': 'Select a schedule',

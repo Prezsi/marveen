@@ -6848,7 +6848,17 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
   const isGlobal = skillModalScope === 'global'
   if (!isGlobal && !currentAgent) return
   const name = document.getElementById('skillName').value.trim()
-  if (!name) { document.getElementById('skillName').focus(); return }
+  if (!name) {
+    document.getElementById('skillName').focus()
+    showToast(t('skills.toast.name_required'))
+    return
+  }
+  const description = document.getElementById('skillDescription').value.trim()
+  if (!description) {
+    document.getElementById('skillDescription').focus()
+    showToast(t('skills.toast.desc_required'))
+    return
+  }
 
   const btn = document.getElementById('saveSkillBtn')
   btn.disabled = true
@@ -6864,12 +6874,12 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name,
-        description: document.getElementById('skillDescription').value.trim(),
+        description,
       }),
     })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Hiba')
+      throw new Error(err.error || t('common.error'))
     }
     const created = await res.json().catch(() => ({}))
     closeModal(skillModalOverlay)
@@ -6880,7 +6890,7 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
       loadSkills(agentApiName())
     }
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
