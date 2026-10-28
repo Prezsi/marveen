@@ -187,6 +187,24 @@ describe('the kanban deletes use it', () => {
     expect(src).not.toMatch(/(^|[^.\w])confirm\(/)
   })
 
+  // Review of #2247: the pins above prove that each button asks, not that the answer counts. With the
+  // `if (!confirmed) return` removed on the card delete, "Mégse" would still delete the card and every
+  // test stayed green. So: the answer of THIS confirmDialog is checked, and returns, before the DELETE.
+  it.each([
+    ['delete a card', "document.getElementById('cardDeleteBtn').onclick = async () => {", "{ method: 'DELETE' })"],
+    ['delete a subtask', 'delBtn.onclick = async (e) => {', "{ method: 'DELETE' })"],
+  ])('%s: a "no" stops it -- the answer is checked before the request', (_name, anchor, request) => {
+    const i = APP.indexOf(anchor)
+    const j = i < 0 ? -1 : APP.indexOf(request, i)
+    const body = i < 0 || j < 0 ? '' : APP.slice(i, j + request.length)
+    expect(body, 'handler or its request not found').not.toBe('')
+    const ask = body.indexOf('const confirmed = await confirmDialog({')
+    const guard = body.indexOf('if (!confirmed) return')
+    expect(ask).toBeGreaterThan(-1)
+    expect(guard).toBeGreaterThan(ask)
+    expect(body.slice(0, guard)).not.toMatch(/\bfetch\(/)
+  })
+
   it.each([
     'kanban.confirm.delete_title', 'kanban.confirm.delete_ok', 'kanban.confirm.delete_subtask_title', 'kanban.confirm.delete_subtask_ok',
     'common.confirm.unsaved_title', 'common.confirm.unsaved', 'common.confirm.unsaved_ok',
