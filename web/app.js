@@ -3343,10 +3343,15 @@ attachOverlayCloseGuard(agentWizardOverlay)
 attachOverlayCloseGuard(agentDetailOverlay)
 attachOverlayCloseGuard(skillModalOverlay)
 
-// Close all modals on Escape
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    document.querySelectorAll('.modal-overlay.active').forEach((o) => closeModal(o))
+// Close all modals on Escape. A confirmDialog on top answers its own Escape as a "no", so the modal
+// under it stays open (closing it too would drop the input the dialog was protecting). The skill
+// editor asks before an unsaved edit is dropped, as its Cancel and close button do.
+document.addEventListener('keydown', async (e) => {
+  if (e.key !== 'Escape') return
+  if (document.querySelector('.confirm-dialog')) return
+  for (const o of document.querySelectorAll('.modal-overlay.active')) {
+    if (o === skillDetailOverlay && !(await _skillDetailConfirmDiscard())) continue
+    closeModal(o)
   }
 })
 

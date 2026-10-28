@@ -95,3 +95,58 @@ describe('skill detail: an unsaved edit is not dropped silently', () => {
     },
   )
 })
+
+// The global Escape handler, run against fake overlays. Before: it closed every active modal at once,
+// so the skill editor's Escape dropped an edit without a question, and an Escape meant as the "no" of a
+// confirmDialog also closed the modal under it (losing the input that dialog was protecting).
+describe('Escape', () => {
+  const start = APP.indexOf("document.addEventListener('keydown', async (e) => {\n  if (e.key !== 'Escape') return")
+  const HANDLER = start < 0 ? '' : APP.slice(start, APP.indexOf('\n})\n', start) + 3)
+
+  function run(opts: { dialogOpen: boolean; discard: boolean }) {
+    const skill = { id: 'skillDetailOverlay' }
+    const other = { id: 'cardModalOverlay' }
+    let listener: ((e: { key: string }) => Promise<void>) | null = null
+    const document = {
+      addEventListener: (_ev: string, fn: (e: { key: string }) => Promise<void>) => { listener = fn },
+      querySelector: (sel: string) => (sel === '.confirm-dialog' && opts.dialogOpen ? {} : null),
+      querySelectorAll: () => [other, skill],
+    }
+    const closed: string[] = []
+    const discard = vi.fn(async () => opts.discard)
+    new Function('document', 'closeModal', 'skillDetailOverlay', '_skillDetailConfirmDiscard', HANDLER)(
+      document, (o: { id: string }) => closed.push(o.id), skill, discard,
+    )
+    return { press: (key: string) => listener!({ key }), closed, discard }
+  }
+
+  it('the handler is found', () => {
+    expect(HANDLER).toContain('closeModal(o)')
+  })
+
+  it('a confirmDialog on top: nothing under it is closed', async () => {
+    const r = run({ dialogOpen: true, discard: true })
+    await r.press('Escape')
+    expect(r.closed).toEqual([])
+    expect(r.discard).not.toHaveBeenCalled()
+  })
+
+  it('the skill editor asks; a "no" keeps it open, other modals still close', async () => {
+    const r = run({ dialogOpen: false, discard: false })
+    await r.press('Escape')
+    expect(r.discard).toHaveBeenCalledTimes(1)
+    expect(r.closed).toEqual(['cardModalOverlay'])
+  })
+
+  it('a "yes" (or nothing unsaved) closes the skill modal too', async () => {
+    const r = run({ dialogOpen: false, discard: true })
+    await r.press('Escape')
+    expect(r.closed).toEqual(['cardModalOverlay', 'skillDetailOverlay'])
+  })
+
+  it('another key does nothing', async () => {
+    const r = run({ dialogOpen: false, discard: true })
+    await r.press('Enter')
+    expect(r.closed).toEqual([])
+  })
+})
