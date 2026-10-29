@@ -460,6 +460,28 @@ describe('the connector removes and deletes use it', () => {
     expect(APP).not.toContain('Biztosan torlod: ${connector.name}')
   })
 
+  it('the GitHub repo install questions have their titles and buttons in both languages', () => {
+    for (const key of ['install_confirm_title', 'install_confirm_ok', 'scripts_skipped_confirm_title', 'scripts_skipped_confirm_ok', 'github_repos']) {
+      expect(HU).toContain(`'connectors.${key}':`)
+      expect(EN).toContain(`'connectors.${key}':`)
+    }
+  })
+
+  it('a multi-paragraph question keeps its line breaks', () => {
+    const CSS = readFileSync(new URL('../../web/style.css', import.meta.url), 'utf-8')
+    const rule = CSS.slice(CSS.indexOf('.confirm-dialog p {'), CSS.indexOf('}', CSS.indexOf('.confirm-dialog p {')))
+    expect(rule).toContain('white-space: pre-line')
+  })
+
+  it('the GitHub repo section has no unaccented labels left', () => {
+    const HTML = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf-8')
+    for (const src of [APP, HTML]) {
+      expect(src).not.toContain('Telepites')
+      expect(src).not.toContain('GitHub repok')
+      expect(src).not.toContain('title="Frissites"')
+    }
+  })
+
   it.each(SITES.flatMap(([, , key]) => [key, `${key}_title`, `${key}_ok`]))('%s is in both languages', (key) => {
     expect(HU).toContain(`'${key}':`)
     expect(EN).toContain(`'${key}':`)

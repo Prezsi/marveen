@@ -9620,7 +9620,12 @@ function renderConnectors() {
 // re-runs the update with scripts and stores the choice for later updates.
 async function offerGitHubRepoScriptsOptIn(name, skipped) {
   if (!Array.isArray(skipped) || skipped.length === 0) return
-  const ok = confirm(t('connectors.scripts_skipped_confirm', { name: name.replace('--', '/'), list: skipped.join(', ') }))
+  const ok = await confirmDialog({
+    title: t('connectors.scripts_skipped_confirm_title'),
+    message: t('connectors.scripts_skipped_confirm', { name: name.replace('--', '/'), list: skipped.join(', ') }),
+    okLabel: t('connectors.scripts_skipped_confirm_ok'),
+    danger: true,
+  })
   if (!ok) return
   const res = await fetch(`/api/connectors/github-repos/${encodeURIComponent(name)}`, {
     method: 'PATCH',
@@ -9643,7 +9648,7 @@ async function loadGitHubRepos() {
       const item = document.createElement('div')
       item.className = 'connector-external-item github-repo-item'
       const date = new Date(r.installedAt).toLocaleDateString('hu-HU')
-      item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(r.name.replace('--', '/'))}</span><span class="github-repo-date">${date}</span></div><div class="github-repo-actions"><button class="github-repo-update" title="Frissites">&#x21bb;</button><button class="github-repo-delete" title="Torles">&times;</button></div>`
+      item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(r.name.replace('--', '/'))}</span><span class="github-repo-date">${date}</span></div><div class="github-repo-actions"><button class="github-repo-update" title="${t('common.btn.refresh')}">&#x21bb;</button><button class="github-repo-delete" title="${t('common.btn.delete')}">&times;</button></div>`
       item.querySelector('.github-repo-update').addEventListener('click', async (e) => {
         const btn = e.currentTarget
         btn.disabled = true
@@ -9834,9 +9839,15 @@ function renderOssRow(e) {
     if (!val) return
     const runScriptsBox = document.getElementById('githubRepoRunScripts')
     const runScripts = !!(runScriptsBox && runScriptsBox.checked)
-    if (!confirm(t(runScripts ? 'connectors.install_confirm_scripts' : 'connectors.install_confirm', { url: val }))) return
+    const confirmed = await confirmDialog({
+      title: t('connectors.install_confirm_title'),
+      message: t(runScripts ? 'connectors.install_confirm_scripts' : 'connectors.install_confirm', { url: val }),
+      okLabel: t('connectors.install_confirm_ok'),
+      danger: runScripts,
+    })
+    if (!confirmed) return
     addBtn.disabled = true
-    addBtn.textContent = 'Telepites...'
+    addBtn.textContent = t('common.installing')
     status.hidden = false
     status.className = 'github-repo-status loading'
     status.textContent = t('connectors.cloning')
@@ -9896,7 +9907,7 @@ function renderOssRow(e) {
       status.textContent = 'Hiba: ' + err.message
     } finally {
       addBtn.disabled = false
-      addBtn.textContent = 'Telepites'
+      addBtn.textContent = t('connectors.catalog.install_btn')
     }
   })
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') addBtn.click() })
