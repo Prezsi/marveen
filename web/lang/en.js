@@ -672,7 +672,15 @@ window._i18n.en = {
   'connectors.toast.removed':     'Removed',
   'connectors.toast.added':       'Connector added as "{name}" (no spaces/special chars)',
   'connectors.toast.required_field': '{key} is required',
-  'connectors.confirm.remove':    'Remove: {name}?',
+  'connectors.confirm.remove':    'Remove this connector: "{name}"?',
+  'connectors.confirm.remove_title': 'Remove the connector',
+  'connectors.confirm.remove_ok': 'Remove',
+  'connectors.confirm.repo_delete': 'Delete this GitHub repo: "{name}"?',
+  'connectors.confirm.repo_delete_title': 'Delete the GitHub repo',
+  'connectors.confirm.repo_delete_ok': 'Delete',
+  'connectors.confirm.delete': 'Delete this connector: "{name}"?',
+  'connectors.confirm.delete_title': 'Delete the connector',
+  'connectors.confirm.delete_ok': 'Delete',
   'connectors.env_placeholder':   'value',
 
   // --- Channel access ---

@@ -9265,7 +9265,13 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
 })
 
 async function catalogUninstall(item) {
-  if (!confirm(t('connectors.confirm.remove', { name: item.name }))) return
+  const confirmed = await confirmDialog({
+    title: t('connectors.confirm.remove_title'),
+    message: t('connectors.confirm.remove', { name: item.name }),
+    okLabel: t('connectors.confirm.remove_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch(`/api/mcp-catalog/${encodeURIComponent(item.id)}/uninstall`, { method: 'DELETE' })
     const data = await res.json()
@@ -9651,7 +9657,13 @@ async function loadGitHubRepos() {
         } finally { btn.disabled = false; btn.innerHTML = '&#x21bb;' }
       })
       item.querySelector('.github-repo-delete').addEventListener('click', async () => {
-        if (!confirm(`Torlod: ${r.name.replace('--', '/')}?`)) return
+        const confirmed = await confirmDialog({
+          title: t('connectors.confirm.repo_delete_title'),
+          message: t('connectors.confirm.repo_delete', { name: r.name.replace('--', '/') }),
+          okLabel: t('connectors.confirm.repo_delete_ok'),
+          danger: true,
+        })
+        if (!confirmed) return
         await fetch(`/api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'DELETE' })
         loadGitHubRepos()
         loadExternalPaths()
@@ -11110,7 +11122,13 @@ async function openConnectorDetail(connector) {
 
   // Delete button
   document.getElementById('connectorDeleteBtn').onclick = async () => {
-    if (!confirm(`Biztosan torlod: ${connector.name}?`)) return
+    const confirmed = await confirmDialog({
+      title: t('connectors.confirm.delete_title'),
+      message: t('connectors.confirm.delete', { name: connector.name }),
+      okLabel: t('connectors.confirm.delete_ok'),
+      danger: true,
+    })
+    if (!confirmed) return
     try {
       await fetch(`/api/connectors/${encodeURIComponent(connector.name)}`, { method: 'DELETE' })
       closeModal(connectorDetailOverlay)

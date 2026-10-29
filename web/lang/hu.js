@@ -945,7 +945,15 @@ window._i18n.hu = {
   'connectors.toast.removed':     'Eltávolítva',
   'connectors.toast.added':       'Connector hozzáadva "{name}" néven (szóköz/speciális karakter nem engedélyezett)',
   'connectors.toast.required_field': '{key} megadása kötelező',
-  'connectors.confirm.remove':    'Biztosan eltávolítod: {name}?',
+  'connectors.confirm.remove':    'Biztosan eltávolítod ezt a connectort: "{name}"?',
+  'connectors.confirm.remove_title': 'Connector eltávolítása',
+  'connectors.confirm.remove_ok': 'Eltávolítás',
+  'connectors.confirm.repo_delete': 'Biztosan törlöd ezt a GitHub-repót: "{name}"?',
+  'connectors.confirm.repo_delete_title': 'GitHub-repó törlése',
+  'connectors.confirm.repo_delete_ok': 'Törlés',
+  'connectors.confirm.delete': 'Biztosan törlöd ezt a connectort: "{name}"?',
+  'connectors.confirm.delete_title': 'Connector törlése',
+  'connectors.confirm.delete_ok': 'Törlés',
   'connectors.env_placeholder':   'érték',
 
   // --- Channel access ---
